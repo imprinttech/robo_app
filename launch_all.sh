@@ -19,9 +19,9 @@ set -u
 # ── Configuration (edit if your paths differ) ─────────────────────────────────
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
-WS_SETUP="${WS_SETUP:-$HOME/AGV/sim_ws/install/setup.bash}"
+WS_SETUP="${WS_SETUP:-$HOME/AGV/ros2_ws/install/setup.bash}"
 UVICORN="${UVICORN:-$HOME/.local/bin/uvicorn}"
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-88}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-38}"
 
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"

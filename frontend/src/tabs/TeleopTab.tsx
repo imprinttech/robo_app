@@ -145,17 +145,6 @@ export function TeleopTab() {
           ))}
         </div>
 
-        {/* Active-key indicator */}
-        <div className="key-indicator" aria-live="polite" aria-label="Active keys">
-          {["w","a","s","d"].map((k) => (
-            <div
-              key={k}
-              className={`key-pill ${activeKeys.has(k as TeleopKey) ? "key-pill--on" : ""}`}
-            >
-              {k.toUpperCase()}
-            </div>
-          ))}
-        </div>
       </section>
 
       {/* ── Status readout ────────────────────────────────────────────── */}

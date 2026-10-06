@@ -44,7 +44,6 @@ export function GoalPoseTab() {
 
   // Robot pose
   const [robotPose,   setRobotPose]   = useState<RobotPose | null>(null);
-  const [poseError,   setPoseError]   = useState<string | null>(null);
 
   // Goal placement
   const [goalPose,    setGoalPose]    = useState<GoalPose | null>(null);
@@ -80,10 +79,7 @@ export function GoalPoseTab() {
       try {
         const p = await fetchPose();
         setRobotPose(p);
-        setPoseError(null);
-      } catch (e: unknown) {
-        setPoseError(e instanceof Error ? e.message : "Pose error");
-      }
+      } catch { /* non-fatal — AMCL may not be ready */ }
     };
     poll();
     poseIntervalRef.current = setInterval(poll, 500);
@@ -114,6 +110,12 @@ export function GoalPoseTab() {
     setManualY(pose.y.toFixed(3));
     setManualYaw(pose.yaw_deg.toFixed(1));
     setSendError(null);
+  }, []);
+
+  const handleGoalPreview = useCallback((pose: GoalPose) => {
+    setManualX(pose.x.toFixed(3));
+    setManualY(pose.y.toFixed(3));
+    setManualYaw(pose.yaw_deg.toFixed(1));
   }, []);
 
   // ── Send goal ──────────────────────────────────────────────────────────────
@@ -198,6 +200,7 @@ export function GoalPoseTab() {
             robotPose={robotPose}
             goalPose={goalPose}
             onGoalSet={handleGoalSet}
+            onGoalPreview={handleGoalPreview}
             loading={mapLoading}
             error={mapError}
           />
@@ -214,30 +217,22 @@ export function GoalPoseTab() {
       {/* ── Right panel: Controls ─────────────────────────────────────────── */}
       <aside className="goalpose-controls-panel">
 
-        {/* Robot Pose */}
+        {/* Navigation Status — replaces AMCL pose card */}
         <div className="card">
-          <div className="card__title">Robot Pose (AMCL)</div>
-          {poseError ? (
-            <p className="pose-unavailable">
-              {poseError.includes("404") ? "Waiting for AMCL…" : poseError}
-            </p>
-          ) : robotPose ? (
-            <dl className="status-dl">
-              <div className="status-row">
-                <dt>X</dt>
-                <dd className="mono">{robotPose.x.toFixed(3)} m</dd>
-              </div>
-              <div className="status-row">
-                <dt>Y</dt>
-                <dd className="mono">{robotPose.y.toFixed(3)} m</dd>
-              </div>
-              <div className="status-row">
-                <dt>Yaw</dt>
-                <dd className="mono">{robotPose.yaw_deg.toFixed(1)} °</dd>
-              </div>
-            </dl>
+          <div className="card__title">Navigation Status</div>
+          {navStatus ? (
+            <div className="nav-status-badge-row">
+              <span className={`badge ${STATUS_CLASS[statusStr] ?? "badge--dim"}`}>
+                {statusStr}
+              </span>
+              {isActive && (
+                <span className="nav-status-distance">
+                  {navStatus.distance_remaining.toFixed(2)} m remaining
+                </span>
+              )}
+            </div>
           ) : (
-            <p className="pose-unavailable">No pose yet</p>
+            <p className="status-idle">Polling…</p>
           )}
         </div>
 
@@ -245,9 +240,33 @@ export function GoalPoseTab() {
         <div className="card">
           <div className="card__title">Navigation Goal</div>
           <p className="goalpose-hint">
-            📍 Click the map to place a goal (1st click = position, 2nd = heading).
-            Or enter coordinates manually:
+            🎯 Drag an arrow on the map to set goal &amp; orientation (like RViz), or enter coordinates manually:
           </p>
+          <div className="goalpose-actions">
+            <button
+              id="btn-send-goal"
+              className="btn btn--primary"
+              onClick={handleSend}
+              disabled={sending || pausing}
+            >
+              {sending ? "Sending…" : "🎯 Send Goal"}
+            </button>
+            <button
+              id="btn-toggle-stop"
+              className={paused ? "btn btn--resume" : "btn btn--stop"}
+              onClick={handleToggleStop}
+              disabled={pausing || sending}
+            >
+              {pausing
+                ? (paused ? "Resuming…" : "Stopping…")
+                : (paused ? "▶ Resume" : "⏸ Stop")}
+            </button>
+          </div>
+
+          {sendError && (
+            <p className="goalpose-error">{sendError}</p>
+          )}
+
           <div className="goalpose-fields">
             <label htmlFor="goal-x" className="goalpose-label">X (m)</label>
             <input
@@ -279,79 +298,28 @@ export function GoalPoseTab() {
               onChange={(e) => setManualYaw(e.target.value)}
             />
           </div>
-
-          {sendError && (
-            <p className="goalpose-error">{sendError}</p>
-          )}
-
-          <div className="goalpose-actions">
-            <button
-              id="btn-send-goal"
-              className="btn btn--primary"
-              onClick={handleSend}
-              disabled={sending || pausing}
-            >
-              {sending ? "Sending…" : "🎯 Send Goal"}
-            </button>
-            <button
-              id="btn-toggle-stop"
-              className={paused ? "btn btn--resume" : "btn btn--stop"}
-              onClick={handleToggleStop}
-              disabled={pausing || sending}
-            >
-              {pausing
-                ? (paused ? "Resuming…" : "Stopping…")
-                : (paused ? "▶ Resume" : "⏸ Stop")}
-            </button>
-          </div>
         </div>
 
-        {/* Navigation Status */}
+        {/* Robot Pose (AMCL) */}
         <div className="card">
-          <div className="card__title">Navigation Status</div>
-          {navStatus ? (
+          <div className="card__title">Robot Pose (AMCL)</div>
+          {robotPose ? (
             <dl className="status-dl">
               <div className="status-row">
-                <dt>Status</dt>
-                <dd>
-                  <span className={`badge ${STATUS_CLASS[statusStr] ?? "badge--dim"}`}>
-                    {statusStr}
-                  </span>
-                </dd>
+                <dt>X</dt>
+                <dd className="mono">{robotPose.x.toFixed(3)} m</dd>
               </div>
-              {navStatus.goal_id && (
-                <div className="status-row">
-                  <dt>Goal ID</dt>
-                  <dd className="mono" style={{ fontSize: "0.7rem", wordBreak: "break-all" }}>
-                    {navStatus.goal_id.slice(0, 8)}…
-                  </dd>
-                </div>
-              )}
-              {isActive && (
-                <div className="status-row">
-                  <dt>Distance</dt>
-                  <dd className="mono">{navStatus.distance_remaining.toFixed(2)} m</dd>
-                </div>
-              )}
-              {goalPose && (
-                <>
-                  <div className="status-row">
-                    <dt>Goal X</dt>
-                    <dd className="mono">{goalPose.x.toFixed(3)} m</dd>
-                  </div>
-                  <div className="status-row">
-                    <dt>Goal Y</dt>
-                    <dd className="mono">{goalPose.y.toFixed(3)} m</dd>
-                  </div>
-                  <div className="status-row">
-                    <dt>Goal Yaw</dt>
-                    <dd className="mono">{goalPose.yaw_deg.toFixed(1)} °</dd>
-                  </div>
-                </>
-              )}
+              <div className="status-row">
+                <dt>Y</dt>
+                <dd className="mono">{robotPose.y.toFixed(3)} m</dd>
+              </div>
+              <div className="status-row">
+                <dt>Yaw</dt>
+                <dd className="mono">{robotPose.yaw_deg.toFixed(1)} °</dd>
+              </div>
             </dl>
           ) : (
-            <p className="status-idle">Polling…</p>
+            <p className="pose-unavailable">Waiting for AMCL…</p>
           )}
         </div>
 

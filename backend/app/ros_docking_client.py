@@ -78,6 +78,20 @@ def _await_rclpy_future(rclpy_future: Any, timeout: float = 15.0) -> Any:
     return rclpy_future.result()
 
 
+_clients_lock = threading.RLock()
+_action_clients: dict[str, Any] = {}
+
+
+def _get_or_create_action_client(action_type: Any, action_name: str) -> Any:
+    """Return a shared ActionClient for action_name, creating it if needed."""
+    node = _get_or_create_node()
+    with _clients_lock:
+        if action_name not in _action_clients:
+            from rclpy.action import ActionClient
+            _action_clients[action_name] = ActionClient(node, action_type, action_name)
+        return _action_clients[action_name]
+
+
 def _blocking_send_goal(action_type: Any, action_name: str, label: str) -> dict:
     """
     Generic blocking goal sender for dock/undock.
@@ -86,101 +100,94 @@ def _blocking_send_goal(action_type: Any, action_name: str, label: str) -> dict:
     global _active_goal_handle, _active_goal_id, _active_action
     global _current_status, _current_phase, _battery_percentage
 
-    from rclpy.action import ActionClient
+    action_client = _get_or_create_action_client(action_type, action_name)
 
-    node = _get_or_create_node()
-    action_client = ActionClient(node, action_type, action_name)
-
-    try:
-        if not action_client.wait_for_server(timeout_sec=5.0):
-            raise RuntimeError(
-                f"Action server {action_name} not available within 5s"
-            )
-
-        goal_msg = action_type.Goal()
-        goal_msg.start = True
-
-        def _feedback_callback(feedback_msg) -> None:
-            global _current_status, _current_phase, _battery_percentage
-            with _state_lock:
-                _current_phase = str(feedback_msg.feedback.phase)
-                _battery_percentage = float(feedback_msg.feedback.battery_percentage)
-                if _current_status in ("ACCEPTED", "UNKNOWN"):
-                    _current_status = "EXECUTING"
-            logger.debug(
-                "ros_docking_client: %s feedback — phase=%s battery=%.1f%%",
-                label, _current_phase, _battery_percentage,
-            )
-
-        send_goal_future = action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=_feedback_callback,
+    if not action_client.wait_for_server(timeout_sec=15.0):
+        raise RuntimeError(
+            f"Action server {action_name} not available within 15s"
         )
 
-        goal_handle = _await_rclpy_future(send_goal_future, timeout=10.0)
+    goal_msg = action_type.Goal()
+    goal_msg.start = True
 
-        accepted: bool = bool(goal_handle.accepted)
-
-        raw_bytes = bytes(list(goal_handle.goal_id.uuid))
-        goal_id_str = str(_uuid_mod.UUID(bytes=raw_bytes))
-
-        logger.info(
-            "ros_docking_client: %s send_goal — accepted=%s goal_id=%s",
-            label, accepted, goal_id_str,
+    def _feedback_callback(feedback_msg) -> None:
+        global _current_status, _current_phase, _battery_percentage
+        with _state_lock:
+            _current_phase = str(feedback_msg.feedback.phase)
+            _battery_percentage = float(feedback_msg.feedback.battery_percentage)
+            if _current_status in ("ACCEPTED", "UNKNOWN"):
+                _current_status = "EXECUTING"
+        logger.debug(
+            "ros_docking_client: %s feedback — phase=%s battery=%.1f%%",
+            label, _current_phase, _battery_percentage,
         )
 
-        if accepted:
-            with _state_lock:
-                _active_goal_handle = goal_handle
-                _active_goal_id = goal_id_str
-                _active_action = label
-                _current_status = "ACCEPTED"
-                _current_phase = ""
-                _battery_percentage = 0.0
+    send_goal_future = action_client.send_goal_async(
+        goal_msg,
+        feedback_callback=_feedback_callback,
+    )
 
-            def _wait_for_result() -> None:
-                global _current_status, _active_goal_handle, _active_action
-                try:
-                    result_future = goal_handle.get_result_async()
-                    result_response = _await_rclpy_future(
-                        result_future, timeout=300.0
-                    )
-                    status_int = result_response.status
-                    terminal = _STATUS_MAP.get(status_int, "UNKNOWN")
-                    logger.info(
-                        "ros_docking_client: %s goal %s finished — status=%s",
-                        label, goal_id_str, terminal,
-                    )
-                    with _state_lock:
-                        _current_status = terminal
-                        _active_goal_handle = None
-                        _active_action = None
-                except Exception as exc:
-                    logger.error(
-                        "ros_docking_client: _wait_for_result error (%s): %s",
-                        label, exc,
-                    )
-                    with _state_lock:
-                        _current_status = "UNKNOWN"
-                        _active_goal_handle = None
-                        _active_action = None
+    goal_handle = _await_rclpy_future(send_goal_future, timeout=15.0)
 
-            threading.Thread(
-                target=_wait_for_result,
-                name=f"docking_{label}_result_waiter",
-                daemon=True,
-            ).start()
-        else:
-            with _state_lock:
-                _active_goal_handle = None
-                _active_goal_id = goal_id_str
-                _active_action = None
-                _current_status = "ABORTED"
+    accepted: bool = bool(goal_handle.accepted)
 
-        return {"accepted": accepted, "goal_id": goal_id_str}
+    raw_bytes = bytes(list(goal_handle.goal_id.uuid))
+    goal_id_str = str(_uuid_mod.UUID(bytes=raw_bytes))
 
-    finally:
-        action_client.destroy()
+    logger.info(
+        "ros_docking_client: %s send_goal — accepted=%s goal_id=%s",
+        label, accepted, goal_id_str,
+    )
+
+    if accepted:
+        with _state_lock:
+            _active_goal_handle = goal_handle
+            _active_goal_id = goal_id_str
+            _active_action = label
+            _current_status = "ACCEPTED"
+            _current_phase = ""
+            _battery_percentage = 0.0
+
+        def _wait_for_result() -> None:
+            global _current_status, _active_goal_handle, _active_action
+            try:
+                result_future = goal_handle.get_result_async()
+                result_response = _await_rclpy_future(
+                    result_future, timeout=300.0
+                )
+                status_int = result_response.status
+                terminal = _STATUS_MAP.get(status_int, "UNKNOWN")
+                logger.info(
+                    "ros_docking_client: %s goal %s finished — status=%s",
+                    label, goal_id_str, terminal,
+                )
+                with _state_lock:
+                    _current_status = terminal
+                    _active_goal_handle = None
+                    _active_action = None
+            except Exception as exc:
+                logger.error(
+                    "ros_docking_client: _wait_for_result error (%s): %s",
+                    label, exc,
+                )
+                with _state_lock:
+                    _current_status = "UNKNOWN"
+                    _active_goal_handle = None
+                    _active_action = None
+
+        threading.Thread(
+            target=_wait_for_result,
+            name=f"docking_{label}_result_waiter",
+            daemon=True,
+        ).start()
+    else:
+        with _state_lock:
+            _active_goal_handle = None
+            _active_goal_id = goal_id_str
+            _active_action = None
+            _current_status = "ABORTED"
+
+    return {"accepted": accepted, "goal_id": goal_id_str}
 
 
 def _blocking_send_dock_goal() -> dict:

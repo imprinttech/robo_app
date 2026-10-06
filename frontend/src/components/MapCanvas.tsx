@@ -1,23 +1,22 @@
 /**
- * MapCanvas.tsx — Interactive occupancy-grid map with robot pose overlay.
+ * MapCanvas.tsx — Interactive occupancy-grid map with robot pose & RViz-style goal pose.
  *
- * Props:
- *   mapData   — OccupancyGrid description fetched from /api/map
- *   robotPose — Current robot pose (x, y, yaw_deg) in map frame, or null
- *   goalPose  — Pending goal pose (x, y, yaw_deg) in map frame, or null
- *   onGoalSet — Called when the user clicks the map to place a new goal
- *   loading   — Show loading skeleton
- *   error     — Show error message instead of canvas
+ * Features:
+ *   1. Robot Pose with Clear Heading Arrow:
+ *      - Renders robot chassis with glowing accent rim.
+ *      - Draws a prominent, forward-facing directional arrow in the heading direction (yaw_deg).
+ *      - Informative label showing world coordinates and heading angle.
  *
- * Coordinate conventions:
- *   ROS OccupancyGrid:  row 0 = bottom of map (smallest Y)
- *   Canvas:             row 0 = top of screen
- *   → We flip vertically when drawing: canvasRow = (height - 1 - rosRow)
+ *   2. RViz-style Click-and-Drag Goal Pose:
+ *      - Left-click mousedown sets goal position (X, Y).
+ *      - Dragging draws an interactive arrow in real-time towards the cursor, orienting the heading.
+ *      - Mouseup finalizes the goal position and orientation.
  *
- * Cell value colours:
- *   -1 (unknown) → #1e2a3a  (dark blue-grey)
- *    0 (free)    → #0d1117  (near-black, slightly lighter)
- *  1–100 (occ)  → interpolated #f85149 → #ff6e6e (red gradient by probability)
+ *   3. Independent Map Zoom & Pan:
+ *      - Mouse wheel smoothly zooms in/out centered at cursor position.
+ *      - Right-click drag or Middle-click drag pans the map around.
+ *      - Floating toolbar with Zoom In, Zoom Out, Reset (Fit), and Goal vs Pan mode toggles.
+ *      - Confined entirely to the map panel — page layout remains stable.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -25,7 +24,7 @@ import type { MapData, RobotPose } from "../lib/mapApi";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface GoalPose {
+export interface GoalPose {
   x: number;
   y: number;
   yaw_deg: number;
@@ -36,96 +35,115 @@ interface Props {
   robotPose: RobotPose | null;
   goalPose: GoalPose | null;
   onGoalSet: (pose: GoalPose) => void;
+  onGoalPreview?: (pose: GoalPose) => void;
   loading?: boolean;
   error?: string | null;
 }
 
-// ── Colour palette ────────────────────────────────────────────────────────────
-const COLOR_UNKNOWN = "#1e2a3a";
-const COLOR_FREE = "#0d1117";
-const COLOR_OCC = [248, 81, 73];   // RGB for fully occupied
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/** Convert map-frame world coords → canvas pixel coords. */
-function worldToCanvas(
-  worldX: number, worldY: number,
-  map: MapData, scale: number
-): [number, number] {
-  const cellX = (worldX - map.origin_x) / map.resolution;
-  const cellY = (worldY - map.origin_y) / map.resolution;
-  // Flip Y: ROS row 0 is bottom, canvas row 0 is top
-  const px = cellX * scale;
-  const py = (map.height - cellY) * scale;
-  return [px, py];
+interface DragState {
+  isDragging: boolean;
+  startScreen: [number, number];
+  startWorld: [number, number];
+  curScreen: [number, number];
+  curWorld: [number, number];
+  yawDeg: number;
 }
 
-/** Convert canvas pixel coords → map-frame world coords. */
-function canvasToWorld(
-  px: number, py: number,
-  map: MapData, scale: number,
-  rect: DOMRect
-): [number, number] {
-  const cellX = (px - rect.left) / scale;
-  const cellY = map.height - (py - rect.top) / scale;
-  const worldX = cellX * map.resolution + map.origin_x;
-  const worldY = cellY * map.resolution + map.origin_y;
-  return [worldX, worldY];
+interface PanState {
+  isPanning: boolean;
+  startX: number;
+  startY: number;
+  initX: number;
+  initY: number;
 }
 
-/** Draw an arrow (robot or goal marker) on the canvas. */
-function drawArrow(
+// ── Occupancy Grid Colors ─────────────────────────────────────────────────────
+const COLOR_OCC = [248, 81, 73]; // Occupied RGB
+
+// ── Canvas Helper: Rounded Rectangle ──────────────────────────────────────────
+function drawRoundRect(
   ctx: CanvasRenderingContext2D,
-  cx: number, cy: number,
-  yawDeg: number,
-  radius: number,
-  color: string,
-  glowColor: string
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
 ) {
-  const angle = (yawDeg * Math.PI) / 180;
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(-angle); // canvas Y is flipped
-
-  // Glow
-  ctx.shadowColor = glowColor;
-  ctx.shadowBlur = 12;
-
-  // Circle body
   ctx.beginPath();
-  ctx.arc(0, 0, radius, 0, Math.PI * 2);
-  ctx.fillStyle = color;
-  ctx.fill();
-  ctx.strokeStyle = "#ffffff44";
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  // Direction arrow
-  ctx.shadowBlur = 0;
-  ctx.beginPath();
-  ctx.moveTo(radius * 0.4, 0);
-  ctx.lineTo(-radius * 0.35, radius * 0.35);
-  ctx.lineTo(-radius * 0.1, 0);
-  ctx.lineTo(-radius * 0.35, -radius * 0.35);
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
   ctx.closePath();
-  ctx.fillStyle = "#ffffff";
-  ctx.fill();
-
-  ctx.restore();
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export const MapCanvas: React.FC<Props> = ({
-  mapData, robotPose, goalPose, onGoalSet, loading = false, error = null
+  mapData,
+  robotPose,
+  goalPose,
+  onGoalSet,
+  onGoalPreview,
+  loading = false,
+  error = null,
 }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const offscreenRef = useRef<HTMLCanvasElement | null>(null);
   const mapDrawnRef = useRef(false);
-  const [scale, setScale] = useState(1);
-  const [pendingYaw, setPendingYaw] = useState<{ x: number; y: number } | null>(null);
 
-  // ── Render the static occupancy grid to an offscreen canvas ────────────────
+  // View camera state (confined strictly to map alone)
+  const [zoom, setZoom] = useState<number>(1.0);
+  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [mode, setMode] = useState<"goal" | "pan">("goal");
+  const [isPanningUI, setIsPanningUI] = useState(false);
+
+  // Live drag state for RViz-style goal arrow placement
+  const [dragState, setDragState] = useState<DragState | null>(null);
+
+  // Resize observer state to redraw on container dimensions change / mobile rotation
+  const [, setDimensions] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setDimensions({ width, height });
+      }
+    });
+
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, []);
+
+  // Mutable refs for tracking active drag and pan operations
+  const dragRef = useRef<DragState | null>(null);
+  const panRef = useRef<PanState>({
+    isPanning: false,
+    startX: 0,
+    startY: 0,
+    initX: 0,
+    initY: 0,
+  });
+
+  // Active pointers map for mobile multi-touch (pinch-to-zoom & two-finger pan)
+  const activePointersRef = useRef<Map<number, { clientX: number; clientY: number }>>(new Map());
+  const pinchStateRef = useRef<{
+    startDist: number;
+    startZoom: number;
+    startMidWorld: [number, number];
+  } | null>(null);
+
+  // ── Render Static Map to Offscreen Canvas ──────────────────────────────────
   const renderMapOffscreen = useCallback((map: MapData) => {
     const offscreen = document.createElement("canvas");
     offscreen.width = map.width;
@@ -135,166 +153,680 @@ export const MapCanvas: React.FC<Props> = ({
     const pixels = imageData.data;
 
     for (let row = 0; row < map.height; row++) {
-      // ROS row 0 = bottom; canvas row 0 = top → flip
+      // ROS row 0 = bottom; canvas row 0 = top -> flip vertically
       const rosRow = map.height - 1 - row;
       for (let col = 0; col < map.width; col++) {
         const idx = rosRow * map.width + col;
         const val = map.data[idx];
         const pixIdx = (row * map.width + col) * 4;
+
         if (val < 0) {
-          // Unknown
-          pixels[pixIdx] = 0x1e;
-          pixels[pixIdx + 1] = 0x2a;
-          pixels[pixIdx + 2] = 0x3a;
+          // Unknown space: dark slate/blue-gray
+          pixels[pixIdx] = 0x16;
+          pixels[pixIdx + 1] = 0x1f;
+          pixels[pixIdx + 2] = 0x2c;
           pixels[pixIdx + 3] = 255;
         } else if (val === 0) {
-          // Free
-          pixels[pixIdx] = 0x0d;
-          pixels[pixIdx + 1] = 0x11;
-          pixels[pixIdx + 2] = 0x17;
+          // Free space: dark background
+          pixels[pixIdx] = 0x09;
+          pixels[pixIdx + 1] = 0x0d;
+          pixels[pixIdx + 2] = 0x13;
           pixels[pixIdx + 3] = 255;
         } else {
-          // Occupied — red, brighter for higher probability
-          const t = val / 100;
-          pixels[pixIdx] = Math.round(COLOR_OCC[0] * t + 0x2a * (1 - t));
+          // Occupied obstacle: vibrant red gradient
+          const t = Math.min(1.0, val / 100);
+          pixels[pixIdx] = Math.round(COLOR_OCC[0] * t + 0x3a * (1 - t));
           pixels[pixIdx + 1] = Math.round(COLOR_OCC[1] * t);
           pixels[pixIdx + 2] = Math.round(COLOR_OCC[2] * t);
           pixels[pixIdx + 3] = 255;
         }
       }
     }
+
     ctx.putImageData(imageData, 0, 0);
     offscreenRef.current = offscreen;
     mapDrawnRef.current = true;
   }, []);
 
-  // ── Determine display scale to fit the container ───────────────────────────
-  useEffect(() => {
-    if (!mapData) return;
-    const container = canvasRef.current?.parentElement;
-    if (!container) return;
-    const maxW = container.clientWidth - 8;
-    const maxH = Math.min(container.clientHeight || 480, 520);
-    const scaleW = maxW / mapData.width;
-    const scaleH = maxH / mapData.height;
-    setScale(Math.max(0.5, Math.min(3.0, Math.min(scaleW, scaleH))));
-  }, [mapData]);
-
-  // ── Re-render the full canvas on every change ──────────────────────────────
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !mapData) return;
-    const ctx = canvas.getContext("2d")!;
-
-    // 1. Draw the offscreen map (lazy — only if not yet rendered)
-    if (!mapDrawnRef.current) renderMapOffscreen(mapData);
-
-    canvas.width = mapData.width * scale;
-    canvas.height = mapData.height * scale;
-
-    ctx.imageSmoothingEnabled = false;
-    if (offscreenRef.current) {
-      ctx.drawImage(offscreenRef.current, 0, 0, canvas.width, canvas.height);
-    }
-
-    // 2. Draw grid overlay (only when zoomed enough)
-    if (scale >= 4) {
-      ctx.strokeStyle = "rgba(255,255,255,0.07)";
-      ctx.lineWidth = 0.5;
-      for (let c = 0; c <= mapData.width; c++) {
-        ctx.beginPath();
-        ctx.moveTo(c * scale, 0);
-        ctx.lineTo(c * scale, canvas.height);
-        ctx.stroke();
-      }
-      for (let r = 0; r <= mapData.height; r++) {
-        ctx.beginPath();
-        ctx.moveTo(0, r * scale);
-        ctx.lineTo(canvas.width, r * scale);
-        ctx.stroke();
-      }
-    }
-
-    // 3. Draw goal pose
-    if (goalPose) {
-      const [gx, gy] = worldToCanvas(goalPose.x, goalPose.y, mapData, scale);
-      drawArrow(ctx, gx, gy, goalPose.yaw_deg, scale * 1.8, "#f0a500bb", "#f0a500");
-
-      // Label
-      ctx.font = `${Math.max(9, scale * 1.2)}px monospace`;
-      ctx.fillStyle = "#f0a500";
-      ctx.fillText(`Goal (${goalPose.x.toFixed(1)}, ${goalPose.y.toFixed(1)})`, gx + scale * 2.5, gy - scale * 2);
-    }
-
-    // 4. Draw robot pose
-    if (robotPose) {
-      const [rx, ry] = worldToCanvas(robotPose.x, robotPose.y, mapData, scale);
-      drawArrow(ctx, rx, ry, robotPose.yaw_deg, scale * 2.0, "#58a6ff", "#58a6ff");
-
-      ctx.font = `${Math.max(9, scale * 1.2)}px monospace`;
-      ctx.fillStyle = "#58a6ff";
-      ctx.fillText("Robot", rx + scale * 2.5, ry + scale * 1.5);
-    }
-
-    // 5. Pending click indicator (first click = position, second = direction)
-    if (pendingYaw) {
-      const [cx, cy] = worldToCanvas(pendingYaw.x, pendingYaw.y, mapData, scale);
-      ctx.beginPath();
-      ctx.arc(cx, cy, scale * 1.5, 0, Math.PI * 2);
-      ctx.strokeStyle = "#f0a500";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([4, 3]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.font = `${Math.max(10, scale * 1.3)}px sans-serif`;
-      ctx.fillStyle = "#f0a500aa";
-      ctx.fillText("Click to set heading →", cx + scale * 2, cy - scale * 2);
-    }
-  }, [mapData, robotPose, goalPose, scale, pendingYaw, renderMapOffscreen]);
-
-  // Invalidate offscreen when mapData changes
+  // Invalidate offscreen cache when mapData changes
   useEffect(() => {
     mapDrawnRef.current = false;
     offscreenRef.current = null;
   }, [mapData]);
 
-  // ── Click handler: two-click goal placement ────────────────────────────────
-  const handleClick = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!mapData) return;
-      const rect = canvasRef.current!.getBoundingClientRect();
-      const [wx, wy] = canvasToWorld(e.clientX, e.clientY, mapData, scale, rect);
+  // ── Viewport Geometry & Coordinate Transformations ──────────────────────────
+  const getViewportMetrics = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !mapData) {
+      return { cssWidth: 600, cssHeight: 500, fitScale: 1, cellScale: 1, viewX: 0, viewY: 0 };
+    }
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = Math.max(100, rect.width);
+    const cssHeight = Math.max(100, rect.height);
 
-      if (!pendingYaw) {
-        // First click: set position
-        setPendingYaw({ x: wx, y: wy });
-      } else {
-        // Second click: compute heading from first click to this click
-        const dx = wx - pendingYaw.x;
-        const dy = wy - pendingYaw.y;
-        const yawDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
-        onGoalSet({ x: pendingYaw.x, y: pendingYaw.y, yaw_deg: yawDeg });
-        setPendingYaw(null);
-      }
+    const fitScale = Math.min(cssWidth / mapData.width, cssHeight / mapData.height) * 0.94;
+    const cellScale = fitScale * zoom;
+
+    const mapPixelW = mapData.width * cellScale;
+    const mapPixelH = mapData.height * cellScale;
+    const baseOffsetX = (cssWidth - mapPixelW) / 2;
+    const baseOffsetY = (cssHeight - mapPixelH) / 2;
+
+    const viewX = baseOffsetX + panOffset.x;
+    const viewY = baseOffsetY + panOffset.y;
+
+    return { cssWidth, cssHeight, fitScale, cellScale, viewX, viewY };
+  }, [mapData, zoom, panOffset]);
+
+  const screenToWorld = useCallback(
+    (sx: number, sy: number): [number, number] => {
+      if (!mapData) return [0, 0];
+      const { cellScale, viewX, viewY } = getViewportMetrics();
+      const cellX = (sx - viewX) / cellScale;
+      const cellY = mapData.height - (sy - viewY) / cellScale;
+      const wx = cellX * mapData.resolution + mapData.origin_x;
+      const wy = cellY * mapData.resolution + mapData.origin_y;
+      return [wx, wy];
     },
-    [mapData, scale, pendingYaw, onGoalSet]
+    [mapData, getViewportMetrics]
   );
 
-  // Cancel pending goal on right-click / Escape
-  const handleContextMenu = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    setPendingYaw(null);
-  }, []);
+  const worldToScreen = useCallback(
+    (wx: number, wy: number): [number, number] => {
+      if (!mapData) return [0, 0];
+      const { cellScale, viewX, viewY } = getViewportMetrics();
+      const cellX = (wx - mapData.origin_x) / mapData.resolution;
+      const cellY = (wy - mapData.origin_y) / mapData.resolution;
+      const sx = viewX + cellX * cellScale;
+      const sy = viewY + (mapData.height - cellY) * cellScale;
+      return [sx, sy];
+    },
+    [mapData, getViewportMetrics]
+  );
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render Frame ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !mapData) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    if (!mapDrawnRef.current) {
+      renderMapOffscreen(mapData);
+    }
+
+    const { cssWidth, cssHeight, cellScale, viewX, viewY } = getViewportMetrics();
+
+    // High-DPI support for razor-sharp vector rendering
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // 1. Clear background
+    ctx.fillStyle = "#0a0e14";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    // 2. Draw offscreen occupancy map
+    if (offscreenRef.current) {
+      ctx.imageSmoothingEnabled = false; // Preserve crisp grid cells
+      ctx.drawImage(
+        offscreenRef.current,
+        0,
+        0,
+        mapData.width,
+        mapData.height,
+        viewX,
+        viewY,
+        mapData.width * cellScale,
+        mapData.height * cellScale
+      );
+    }
+
+    // 3. Draw map boundary border
+    ctx.strokeStyle = "rgba(88, 166, 255, 0.25)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(viewX, viewY, mapData.width * cellScale, mapData.height * cellScale);
+
+    // 4. Subtle distance grid overlay when zoomed in
+    if (cellScale >= 3.5) {
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+      ctx.lineWidth = 0.5;
+      const step = cellScale * Math.max(1, Math.round(1.0 / mapData.resolution)); // ~1 meter grid
+      const startX = viewX % step;
+      const startY = viewY % step;
+      for (let x = startX; x < cssWidth; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, cssHeight);
+        ctx.stroke();
+      }
+      for (let y = startY; y < cssHeight; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(cssWidth, y);
+        ctx.stroke();
+      }
+    }
+
+    // 5. Draw Placed Goal Pose (if set)
+    if (goalPose && !dragState?.isDragging) {
+      const [gx, gy] = worldToScreen(goalPose.x, goalPose.y);
+      drawNavGoalMarker(ctx, gx, gy, goalPose.yaw_deg, false);
+      drawSimpleLabel(ctx, gx, gy, "Goal", "#f0a500");
+    }
+
+    // 6. Draw Robot Pose with prominent directional arrow (Requirement 1)
+    if (robotPose) {
+      const [rx, ry] = worldToScreen(robotPose.x, robotPose.y);
+      drawRobotMarker(ctx, rx, ry, robotPose.yaw_deg);
+      drawSimpleLabel(ctx, rx, ry, "Robot", "#58a6ff");
+    }
+
+    // 7. Draw RViz-style Click-and-Drag Live Goal Arrow (Requirement 2)
+    if (dragState?.isDragging) {
+      const [sx, sy] = dragState.startScreen;
+      const [cx, cy] = dragState.curScreen;
+      const dragDist = Math.hypot(cx - sx, cy - sy);
+      const arrowLen = Math.max(28, dragDist);
+
+      // Draw dynamic arrow stretching toward cursor
+      drawNavGoalMarker(ctx, sx, sy, dragState.yawDeg, true, arrowLen);
+
+      // HUD readout badge next to the cursor
+      const hudText = `🎯 Goal: (${dragState.startWorld[0].toFixed(2)}, ${dragState.startWorld[1].toFixed(2)})  Heading: ${dragState.yawDeg.toFixed(1)}°`;
+      drawHUDTag(ctx, cx + 16, cy - 12, hudText);
+    }
+  }, [mapData, robotPose, goalPose, dragState, zoom, panOffset, getViewportMetrics, renderMapOffscreen, worldToScreen]);
+
+  // ── Marker Drawing Helpers ──────────────────────────────────────────────────
+
+  /**
+   * Draw Robot Chassis and forward-facing heading arrow.
+   */
+  function drawRobotMarker(ctx: CanvasRenderingContext2D, rx: number, ry: number, yawDeg: number) {
+    const yawRad = (yawDeg * Math.PI) / 180;
+
+    ctx.save();
+    ctx.translate(rx, ry);
+
+    const baseRadius = 9; // Compact chassis circle
+
+    // 1. Robot chassis base circle
+    ctx.shadowColor = "rgba(88, 166, 255, 0.6)";
+    ctx.shadowBlur = 8;
+
+    ctx.beginPath();
+    ctx.arc(0, 0, baseRadius, 0, Math.PI * 2);
+    ctx.fillStyle = "#111b27";
+    ctx.fill();
+    ctx.strokeStyle = "#58a6ff";
+    ctx.lineWidth = 2.0;
+    ctx.stroke();
+
+    // Inner concentric ring
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(0, 0, baseRadius * 0.5, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(88, 166, 255, 0.4)";
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    // Center pivot dot
+    ctx.beginPath();
+    ctx.arc(0, 0, 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    // 2. Forward-Facing Arrow
+    // Note: Canvas Y is flipped downwards, so we rotate by -yawRad
+    ctx.rotate(-yawRad);
+
+    const arrowTotalLength = 21;
+    const headLength = 8.5;
+    const headWidth = 8;
+
+    // Arrow shaft with cyan glow
+    ctx.shadowColor = "#58a6ff";
+    ctx.shadowBlur = 6;
+    ctx.beginPath();
+    ctx.moveTo(baseRadius * 0.35, 0);
+    ctx.lineTo(arrowTotalLength - headLength + 2, 0);
+    ctx.strokeStyle = "#79c0ff";
+    ctx.lineWidth = 2.6;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // Directional Arrowhead
+    ctx.beginPath();
+    ctx.moveTo(arrowTotalLength, 0); // Tip
+    ctx.lineTo(arrowTotalLength - headLength, -headWidth / 2);
+    ctx.lineTo(arrowTotalLength - headLength + 2, 0);
+    ctx.lineTo(arrowTotalLength - headLength, headWidth / 2);
+    ctx.closePath();
+    ctx.fillStyle = "#58a6ff";
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  /**
+   * Draw RViz-style Navigation Goal Marker & Heading Arrow.
+   */
+  function drawNavGoalMarker(
+    ctx: CanvasRenderingContext2D,
+    gx: number,
+    gy: number,
+    yawDeg: number,
+    isLiveDrag: boolean,
+    arrowLength = 28
+  ) {
+    const yawRad = (yawDeg * Math.PI) / 180;
+    const color = isLiveDrag ? "#f0a500" : "#e39800";
+    const glow = isLiveDrag ? "rgba(240, 165, 0, 0.8)" : "rgba(240, 165, 0, 0.45)";
+
+    ctx.save();
+    ctx.translate(gx, gy);
+
+    // 1. Goal base target ring (compact)
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = isLiveDrag ? 12 : 8;
+
+    ctx.beginPath();
+    ctx.arc(0, 0, 6.5, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(240, 165, 0, 0.2)";
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    // Center pivot
+    ctx.beginPath();
+    ctx.arc(0, 0, 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    // 2. Goal Heading Arrow
+    ctx.rotate(-yawRad);
+
+    const headLen = 9.5;
+    const headW = 8.5;
+
+    // Arrow shaft
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(arrowLength - headLen + 2, 0);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.8;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // Arrow head
+    ctx.beginPath();
+    ctx.moveTo(arrowLength, 0);
+    ctx.lineTo(arrowLength - headLen, -headW / 2);
+    ctx.lineTo(arrowLength - headLen + 2, 0);
+    ctx.lineTo(arrowLength - headLen, headW / 2);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  /**
+   * Minimal clean label badge above robot or goal ("Robot", "Goal").
+   */
+  function drawSimpleLabel(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    text: string,
+    accentColor: string
+  ) {
+    ctx.save();
+    ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+    const textWidth = ctx.measureText(text).width;
+    const h = 17;
+    const w = textWidth + 12;
+    const bx = x - w / 2;
+    const by = y - 22;
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "rgba(13, 17, 23, 0.88)";
+    ctx.strokeStyle = accentColor;
+    ctx.lineWidth = 1;
+    drawRoundRect(ctx, bx, by, w, h, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = accentColor;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "center";
+    ctx.fillText(text, x, by + h / 2 + 0.5);
+    ctx.restore();
+  }
+
+  /**
+   * HUD readout tag during interactive drag.
+   */
+  function drawHUDTag(ctx: CanvasRenderingContext2D, x: number, y: number, text: string) {
+    ctx.font = "bold 11px sans-serif";
+    const tw = ctx.measureText(text).width;
+    const h = 24;
+    const w = tw + 16;
+
+    ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
+    ctx.shadowBlur = 10;
+
+    ctx.fillStyle = "rgba(22, 27, 34, 0.94)";
+    ctx.strokeStyle = "#f0a500";
+    ctx.lineWidth = 1.5;
+    drawRoundRect(ctx, x, y, w, h, 6);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+    ctx.fillText(text, x + 8, y + h / 2);
+  }
+
+  // ── Mouse & Pointer Event Handlers ──────────────────────────────────────────
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!mapData) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    activePointersRef.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+
+    // Multi-touch: 2 or more fingers -> Enter pinch-to-zoom and two-finger pan mode
+    if (activePointersRef.current.size >= 2) {
+      if (dragRef.current) {
+        dragRef.current.isDragging = false;
+        setDragState(null);
+      }
+      if (panRef.current.isPanning) {
+        panRef.current.isPanning = false;
+        setIsPanningUI(false);
+      }
+
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[0].clientX - pts[1].clientX, pts[0].clientY - pts[1].clientY);
+      const midClientX = (pts[0].clientX + pts[1].clientX) / 2;
+      const midClientY = (pts[0].clientY + pts[1].clientY) / 2;
+
+      const rect = canvas.getBoundingClientRect();
+      const midX = midClientX - rect.left;
+      const midY = midClientY - rect.top;
+      const midWorld = screenToWorld(midX, midY);
+
+      pinchStateRef.current = {
+        startDist: Math.max(10, dist),
+        startZoom: zoom,
+        startMidWorld: midWorld,
+      };
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    // Right-click (button 2), Middle-click (button 1), or Pan mode with Left-click / Touch
+    if (e.button === 2 || e.button === 1 || (e.button === 0 && mode === "pan")) {
+      panRef.current = {
+        isPanning: true,
+        startX: e.clientX,
+        startY: e.clientY,
+        initX: panOffset.x,
+        initY: panOffset.y,
+      };
+      setIsPanningUI(true);
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    // Left-click / Touch in Goal Mode -> Start RViz-style Goal Pose Drag
+    if (e.button === 0 && mode === "goal") {
+      const [wx, wy] = screenToWorld(mouseX, mouseY);
+      const newDrag: DragState = {
+        isDragging: true,
+        startScreen: [mouseX, mouseY],
+        startWorld: [wx, wy],
+        curScreen: [mouseX, mouseY],
+        curWorld: [wx, wy],
+        yawDeg: 0,
+      };
+      dragRef.current = newDrag;
+      setDragState(newDrag);
+      if (onGoalPreview) {
+        onGoalPreview({ x: wx, y: wy, yaw_deg: 0 });
+      }
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !mapData) return;
+
+    activePointersRef.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+
+    // Handle Active Two-Finger Pinch Zoom & Pan
+    if (activePointersRef.current.size >= 2 && pinchStateRef.current) {
+      const pts = Array.from(activePointersRef.current.values());
+      const curDist = Math.hypot(pts[0].clientX - pts[1].clientX, pts[0].clientY - pts[1].clientY);
+      const curMidClientX = (pts[0].clientX + pts[1].clientX) / 2;
+      const curMidClientY = (pts[0].clientY + pts[1].clientY) / 2;
+
+      const rect = canvas.getBoundingClientRect();
+      const curMidX = curMidClientX - rect.left;
+      const curMidY = curMidClientY - rect.top;
+
+      const scaleFactor = curDist / pinchStateRef.current.startDist;
+      const newZoom = Math.min(10.0, Math.max(0.4, pinchStateRef.current.startZoom * scaleFactor));
+
+      const { cssWidth, cssHeight, fitScale } = getViewportMetrics();
+      const newCellScale = fitScale * newZoom;
+      const newBaseX = (cssWidth - mapData.width * newCellScale) / 2;
+      const newBaseY = (cssHeight - mapData.height * newCellScale) / 2;
+
+      const [wx, wy] = pinchStateRef.current.startMidWorld;
+      const cellX = (wx - mapData.origin_x) / mapData.resolution;
+      const cellY = (wy - mapData.origin_y) / mapData.resolution;
+      const rosPxNew = cellX * newCellScale;
+      const rosPyNew = (mapData.height - cellY) * newCellScale;
+
+      const newPanX = curMidX - newBaseX - rosPxNew;
+      const newPanY = curMidY - newBaseY - rosPyNew;
+
+      setZoom(newZoom);
+      setPanOffset({ x: newPanX, y: newPanY });
+      return;
+    }
+
+    // Handle Active Pan
+    if (panRef.current.isPanning) {
+      const dx = e.clientX - panRef.current.startX;
+      const dy = e.clientY - panRef.current.startY;
+      setPanOffset({
+        x: panRef.current.initX + dx,
+        y: panRef.current.initY + dy,
+      });
+      return;
+    }
+
+    // Handle Active Goal Drag
+    if (dragRef.current?.isDragging) {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      const [curWx, curWy] = screenToWorld(mouseX, mouseY);
+
+      // Calculate heading angle in map world coordinates
+      const dxWorld = curWx - dragRef.current.startWorld[0];
+      const dyWorld = curWy - dragRef.current.startWorld[1];
+      const distWorld = Math.hypot(dxWorld, dyWorld);
+
+      let yawDeg = dragRef.current.yawDeg;
+      if (distWorld > 0.04) {
+        yawDeg = (Math.atan2(dyWorld, dxWorld) * 180) / Math.PI;
+      }
+
+      const updatedDrag: DragState = {
+        ...dragRef.current,
+        curScreen: [mouseX, mouseY],
+        curWorld: [curWx, curWy],
+        yawDeg,
+      };
+      dragRef.current = updatedDrag;
+      setDragState(updatedDrag);
+
+      if (onGoalPreview) {
+        onGoalPreview({
+          x: updatedDrag.startWorld[0],
+          y: updatedDrag.startWorld[1],
+          yaw_deg: yawDeg,
+        });
+      }
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (canvas && canvas.hasPointerCapture(e.pointerId)) {
+      try {
+        canvas.releasePointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size < 2) {
+      pinchStateRef.current = null;
+    }
+
+    // Finish Pan
+    if (panRef.current.isPanning) {
+      panRef.current.isPanning = false;
+      setIsPanningUI(false);
+    }
+
+    // Finish Goal Placement (RViz Style) → auto-switch back to Pan
+    if (dragRef.current?.isDragging) {
+      const finalized = { ...dragRef.current };
+      dragRef.current.isDragging = false;
+      setDragState(null);
+
+      onGoalSet({
+        x: finalized.startWorld[0],
+        y: finalized.startWorld[1],
+        yaw_deg: finalized.yawDeg,
+      });
+
+      // Automatically revert to Pan mode so the user must
+      // explicitly press Goal again before placing the next goal.
+      setMode("pan");
+    }
+  };
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault(); // Prevent default browser context menu for right-drag pan
+  };
+
+  // ── Wheel Zoom Centered at Mouse Cursor (User Requirement 3) ────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !mapData) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault(); // Stop page scrolling entirely when zooming the map
+
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      // 1. World coordinates before zoom
+      const [wx, wy] = screenToWorld(mouseX, mouseY);
+
+      // 2. Calculate new zoom level
+      const factor = e.deltaY < 0 ? 1.16 : 1 / 1.16;
+      const newZoom = Math.min(10.0, Math.max(0.4, zoom * factor));
+      if (Math.abs(newZoom - zoom) < 0.001) return;
+
+      // 3. Adjust pan offset so (wx, wy) remains stationary under cursor
+      const { cssWidth, cssHeight, fitScale } = getViewportMetrics();
+      const newCellScale = fitScale * newZoom;
+      const newMapW = mapData.width * newCellScale;
+      const newMapH = mapData.height * newCellScale;
+      const newBaseX = (cssWidth - newMapW) / 2;
+      const newBaseY = (cssHeight - newMapH) / 2;
+
+      const cellX = (wx - mapData.origin_x) / mapData.resolution;
+      const cellY = (wy - mapData.origin_y) / mapData.resolution;
+      const rosPxNew = cellX * newCellScale;
+      const rosPyNew = (mapData.height - cellY) * newCellScale;
+
+      const newPanX = mouseX - newBaseX - rosPxNew;
+      const newPanY = mouseY - newBaseY - rosPyNew;
+
+      setZoom(newZoom);
+      setPanOffset({ x: newPanX, y: newPanY });
+    };
+
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", onWheel);
+    };
+  }, [mapData, zoom, panOffset, screenToWorld, getViewportMetrics]);
+
+  // ── Zoom Toolbar Controls ───────────────────────────────────────────────────
+  const handleZoomIn = () => {
+    setZoom((z) => Math.min(10.0, z * 1.25));
+  };
+
+  const handleZoomOut = () => {
+    setZoom((z) => Math.max(0.4, z / 1.25));
+  };
+
+  const handleResetView = () => {
+    setZoom(1.0);
+    setPanOffset({ x: 0, y: 0 });
+  };
+
+  // ── Loading & Error States ──────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="map-canvas-placeholder map-canvas-placeholder--loading">
         <div className="map-canvas-spinner" />
-        <p>Fetching map from /map_server/map…</p>
+        <p>Fetching occupancy map from /map_server/map…</p>
       </div>
     );
   }
+
   if (error) {
     return (
       <div className="map-canvas-placeholder map-canvas-placeholder--error">
@@ -304,6 +836,7 @@ export const MapCanvas: React.FC<Props> = ({
       </div>
     );
   }
+
   if (!mapData) {
     return (
       <div className="map-canvas-placeholder">
@@ -313,21 +846,99 @@ export const MapCanvas: React.FC<Props> = ({
     );
   }
 
+  // ── Cursor Class Calculation ────────────────────────────────────────────────
+  let cursorClass = "map-canvas--cursor-goal";
+  if (isPanningUI) {
+    cursorClass = "map-canvas--cursor-grabbing";
+  } else if (mode === "pan") {
+    cursorClass = "map-canvas--cursor-grab";
+  } else if (dragState?.isDragging) {
+    cursorClass = "map-canvas--cursor-dragging";
+  }
+
   return (
-    <div className="map-canvas-wrapper" title={pendingYaw ? "Click to set heading" : "Click to place goal"}>
+    <div className="map-canvas-wrapper" ref={containerRef}>
+      {/* ── Map Canvas Element ─────────────────────────────────────────── */}
       <canvas
         ref={canvasRef}
         id="map-canvas"
-        className={`map-canvas ${pendingYaw ? "map-canvas--set-heading" : "map-canvas--set-goal"}`}
-        onClick={handleClick}
+        className={`map-canvas ${cursorClass}`}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
         onContextMenu={handleContextMenu}
-        aria-label="Occupancy grid map — click to set navigation goal"
+        aria-label="Occupancy grid map — drag to set goal and heading like RViz"
       />
-      {pendingYaw && (
-        <div className="map-canvas-hint">
-          📍 Position set — click again to set heading direction
+
+      {/* ── Independent Map Zoom & Pan Toolbar (Requirement 3) ──────────── */}
+      <div className="map-toolbar">
+        <div className="map-toolbar__group">
+          <button
+            type="button"
+            className={`map-toolbar__btn ${mode === "goal" ? "map-toolbar__btn--active" : ""}`}
+            onClick={() => setMode("goal")}
+            title="Goal Mode: Click and drag arrow to set target and heading (RViz style)"
+          >
+            🎯 Goal
+          </button>
+          <button
+            type="button"
+            className={`map-toolbar__btn ${mode === "pan" ? "map-toolbar__btn--active" : ""}`}
+            onClick={() => setMode("pan")}
+            title="Pan Mode: Left-drag or single-touch to pan the map"
+          >
+            ✋ Pan
+          </button>
         </div>
-      )}
+
+        <div className="map-toolbar__group">
+          <button
+            type="button"
+            className="map-toolbar__btn"
+            onClick={handleZoomIn}
+            title="Zoom In"
+            aria-label="Zoom in"
+          >
+            ＋
+          </button>
+          <button
+            type="button"
+            className="map-toolbar__btn map-toolbar__btn--label"
+            onClick={handleResetView}
+            title="Click to reset zoom to 100%"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            className="map-toolbar__btn"
+            onClick={handleZoomOut}
+            title="Zoom Out"
+            aria-label="Zoom out"
+          >
+            －
+          </button>
+          <button
+            type="button"
+            className="map-toolbar__btn"
+            onClick={handleResetView}
+            title="Fit to view / Reset pan"
+          >
+            ⟲ Fit
+          </button>
+        </div>
+      </div>
+
+      {/* ── Map Interactive Guide Footer ────────────────────────────────── */}
+      <div className="map-footer-hint">
+        <span className="map-footer-hint__desktop">
+          🎯 <strong>Left-drag</strong>: Goal & Heading · ✋ <strong>Right-drag</strong>: Pan · 🔍 <strong>Scroll</strong>: Zoom
+        </span>
+        <span className="map-footer-hint__mobile">
+          🎯 <strong>Goal</strong>: Drag arrow · ✋ <strong>Pan</strong> · 🔍 Pinch zoom
+        </span>
+      </div>
     </div>
   );
 };

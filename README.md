@@ -27,45 +27,17 @@ Browser ─── Vite dev server (5173)
 
 ## Quick Start
 
-### 1. Start the Zenoh bridges (Topics, Services, Actions)
-
-The robot dashboard backend connects to three separate Zenoh bridges:
-- **Topics Bridge**: REST API on `http://localhost:7777`, listening on `tcp/0.0.0.0:7447`
-- **Services Bridge**: REST API on `http://localhost:8888`, listening on `tcp/0.0.0.0:7448`
-- **Actions Bridge**: REST API on `http://localhost:9999`, listening on `tcp/0.0.0.0:7449`
-
-Run them in separate terminals (or in the background) from the `zenoh_scripts/` directory:
+### 1. Start the Zenoh bridge (for topics)
 
 ```bash
-cd warehouse-robot-app/zenoh_scripts
-```
-
-**Terminal 1 — Topics Bridge:**
-```bash
+cd src/zenoh_dashboard
 zenoh-bridge-ros2dds -c zenoh_topics.json5
 ```
-
-**Terminal 2 — Services Bridge:**
-```bash
-zenoh-bridge-ros2dds -c zenoh_services.json5
-```
-
-**Terminal 3 — Actions Bridge:**
-```bash
-zenoh-bridge-ros2dds -c zenoh_actions.json5
-```
-
-> **Tip:** To run all three bridges in the background in a single terminal:
-> ```bash
-> zenoh-bridge-ros2dds -c zenoh_topics.json5 &
-> zenoh-bridge-ros2dds -c zenoh_services.json5 &
-> zenoh-bridge-ros2dds -c zenoh_actions.json5 &
-> ```
 
 ### 2. Start the backend
 
 ```bash
-# Terminal 4 — source ROS 2 first
+# Terminal A — source ROS 2 first
 source /opt/ros/jazzy/setup.bash
 source ~/AGV/sim_ws/install/setup.bash
 
@@ -73,30 +45,28 @@ cd warehouse-robot-app/backend
 pip install -r requirements.txt   # first time only
 pip install --user --break-system-packages -r requirements.txt
 sudo apt install uvicorn
-uvicorn app.main:app --host :: --port 8090 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8090 --reload
 ```
 
 ### 3. Start the frontend
 
 ```bash
-# Terminal 5
+# Terminal B
 cd warehouse-robot-app/frontend
 npm install     # first time only
 sudo apt install npm 
-npm run dev
+npm run dev-+
 ```
 
 Open **http://localhost:5173** in your browser.
 
 ## Environment variables
 
-| Variable                  | Default                 | Description                         |
-|---------------------------|-------------------------|-------------------------------------|
-| `ZENOH_TOPICS_REST_URL`   | `http://localhost:7777` | Zenoh topics bridge REST URL        |
-| `ZENOH_SERVICES_REST_URL` | `http://localhost:8888` | Zenoh services bridge REST URL      |
-| `ZENOH_ACTIONS_REST_URL`  | `http://localhost:9999` | Zenoh actions bridge REST URL       |
-| `ZENOH_ROS_DOMAIN`        | `88`                    | ROS_DOMAIN_ID                       |
-| `BACKEND_CORS_ORIGINS`    | `http://localhost:5173` | Comma-separated CORS origins        |
+| Variable                | Default                   | Description                         |
+|-------------------------|---------------------------|-------------------------------------|
+| `ZENOH_TOPICS_REST_URL` | `http://localhost:7777`   | Zenoh topics bridge REST URL        |
+| `ZENOH_ROS_DOMAIN`      | `88`                      | ROS_DOMAIN_ID                       |
+| `BACKEND_CORS_ORIGINS`  | `http://localhost:5173`   | Comma-separated CORS origins        |
 
 ## Adding future tabs (Goal Pose, SLAM Map)
 

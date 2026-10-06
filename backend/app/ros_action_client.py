@@ -43,7 +43,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ── Shared rclpy node (created once, reused for all action calls) ──────────────
-_node_lock = threading.Lock()
+_node_lock = threading.RLock()
 _node: Any = None
 _executor_thread: threading.Thread | None = None
 
@@ -114,6 +114,28 @@ def _get_or_create_node() -> Any:
     return _node
 
 
+_action_client: Any = None
+
+
+def _get_or_create_action_client() -> Any:
+    """Return the shared NavigateToPose ActionClient, creating it if needed."""
+    global _action_client
+    if _action_client is not None:
+        return _action_client
+
+    node = _get_or_create_node()
+
+    with _node_lock:
+        if _action_client is not None:
+            return _action_client
+
+        from rclpy.action import ActionClient
+        from nav2_msgs.action import NavigateToPose
+
+        _action_client = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+        return _action_client
+
+
 def _deg_to_quat_z(yaw_deg: float) -> dict[str, float]:
     """Convert yaw in degrees to a Z-axis quaternion (2-D navigation)."""
     half = math.radians(yaw_deg) / 2.0
@@ -144,123 +166,114 @@ def _blocking_send_nav_goal(x: float, y: float, yaw_deg: float) -> dict:
     Synchronous rclpy action goal send. Run in thread-pool so the asyncio
     event loop is not blocked.
     """
-    from rclpy.action import ActionClient
     from nav2_msgs.action import NavigateToPose
     from rosidl_runtime_py.set_message import set_message_fields
 
     global _active_goal_handle, _active_goal_id, _current_status, _distance_remaining
 
-    node = _get_or_create_node()
+    action_client = _get_or_create_action_client()
 
-    action_client = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+    if not action_client.wait_for_server(timeout_sec=15.0):
+        raise RuntimeError(
+            "Action server /navigate_to_pose not available within 15s"
+        )
 
-    try:
-        if not action_client.wait_for_server(timeout_sec=5.0):
-            raise RuntimeError(
-                "Action server /navigate_to_pose not available within 5s"
-            )
-
-        # Build goal message
-        goal_msg = NavigateToPose.Goal()
-        quat = _deg_to_quat_z(yaw_deg)
-        set_message_fields(goal_msg, {
+    # Build goal message
+    goal_msg = NavigateToPose.Goal()
+    quat = _deg_to_quat_z(yaw_deg)
+    set_message_fields(goal_msg, {
+        "pose": {
+            "header": {"frame_id": "map"},
             "pose": {
-                "header": {"frame_id": "map"},
-                "pose": {
-                    "position": {"x": x, "y": y, "z": 0.0},
-                    "orientation": quat,
-                },
+                "position": {"x": x, "y": y, "z": 0.0},
+                "orientation": quat,
             },
-            "behavior_tree": "",
-        })
+        },
+        "behavior_tree": "",
+    })
 
-        def _feedback_callback(feedback_msg) -> None:
-            global _distance_remaining, _current_status
-            with _state_lock:
-                _distance_remaining = float(
-                    feedback_msg.feedback.distance_remaining
-                )
-                # First feedback means the goal is actively executing
-                if _current_status in ("ACCEPTED", "UNKNOWN"):
-                    _current_status = "EXECUTING"
-            logger.debug(
-                "ros_action_client: feedback — distance_remaining=%.3f",
-                _distance_remaining,
+    def _feedback_callback(feedback_msg) -> None:
+        global _distance_remaining, _current_status
+        with _state_lock:
+            _distance_remaining = float(
+                feedback_msg.feedback.distance_remaining
             )
-
-        # Send goal (returns an rclpy Future for the goal handle)
-        send_goal_future = action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=_feedback_callback,
+            # First feedback means the goal is actively executing
+            if _current_status in ("ACCEPTED", "UNKNOWN"):
+                _current_status = "EXECUTING"
+        logger.debug(
+            "ros_action_client: feedback — distance_remaining=%.3f",
+            _distance_remaining,
         )
 
-        # Block until send_goal response arrives (bt_navigator accepted/rejected)
-        goal_handle = _await_rclpy_future(send_goal_future, timeout=10.0)
+    # Send goal (returns an rclpy Future for the goal handle)
+    send_goal_future = action_client.send_goal_async(
+        goal_msg,
+        feedback_callback=_feedback_callback,
+    )
 
-        accepted: bool = bool(goal_handle.accepted)
+    # Block until send_goal response arrives (bt_navigator accepted/rejected)
+    goal_handle = _await_rclpy_future(send_goal_future, timeout=15.0)
 
-        # Derive a human-readable UUID string from the 16-byte UUID array
-        raw_bytes = bytes(list(goal_handle.goal_id.uuid))
-        goal_id_str = str(_uuid_mod.UUID(bytes=raw_bytes))
+    accepted: bool = bool(goal_handle.accepted)
 
-        logger.info(
-            "ros_action_client: send_goal response — accepted=%s goal_id=%s",
-            accepted,
-            goal_id_str,
-        )
+    # Derive a human-readable UUID string from the 16-byte UUID array
+    raw_bytes = bytes(list(goal_handle.goal_id.uuid))
+    goal_id_str = str(_uuid_mod.UUID(bytes=raw_bytes))
 
-        if accepted:
-            with _state_lock:
-                _active_goal_handle = goal_handle
-                _active_goal_id = goal_id_str
-                _current_status = "ACCEPTED"
-                _distance_remaining = 0.0
+    logger.info(
+        "ros_action_client: send_goal response — accepted=%s goal_id=%s",
+        accepted,
+        goal_id_str,
+    )
 
-            # Kick off get_result_async() in a daemon thread; it will update
-            # the status cache when the action terminates.
-            def _wait_for_result() -> None:
-                global _current_status, _active_goal_handle
-                try:
-                    result_future = goal_handle.get_result_async()
-                    result_response = _await_rclpy_future(
-                        result_future, timeout=300.0
-                    )
-                    status_int = result_response.status
-                    terminal = _STATUS_MAP.get(status_int, "UNKNOWN")
-                    logger.info(
-                        "ros_action_client: goal %s finished — status=%s",
-                        goal_id_str,
-                        terminal,
-                    )
-                    with _state_lock:
-                        _current_status = terminal
-                        _active_goal_handle = None
-                except Exception as exc:
-                    logger.error(
-                        "ros_action_client: _wait_for_result error: %s", exc
-                    )
-                    with _state_lock:
-                        _current_status = "UNKNOWN"
-                        _active_goal_handle = None
+    if accepted:
+        with _state_lock:
+            _active_goal_handle = goal_handle
+            _active_goal_id = goal_id_str
+            _current_status = "ACCEPTED"
+            _distance_remaining = 0.0
 
-            threading.Thread(
-                target=_wait_for_result,
-                name="nav_goal_result_waiter",
-                daemon=True,
-            ).start()
-        else:
-            # Goal rejected — clear any stale state
-            with _state_lock:
-                _active_goal_handle = None
-                _active_goal_id = goal_id_str
-                _current_status = "ABORTED"
+        # Kick off get_result_async() in a daemon thread; it will update
+        # the status cache when the action terminates.
+        def _wait_for_result() -> None:
+            global _current_status, _active_goal_handle
+            try:
+                result_future = goal_handle.get_result_async()
+                result_response = _await_rclpy_future(
+                    result_future, timeout=300.0
+                )
+                status_int = result_response.status
+                terminal = _STATUS_MAP.get(status_int, "UNKNOWN")
+                logger.info(
+                    "ros_action_client: goal %s finished — status=%s",
+                    goal_id_str,
+                    terminal,
+                )
+                with _state_lock:
+                    _current_status = terminal
+                    _active_goal_handle = None
+            except Exception as exc:
+                logger.error(
+                    "ros_action_client: _wait_for_result error: %s", exc
+                )
+                with _state_lock:
+                    _current_status = "UNKNOWN"
+                    _active_goal_handle = None
 
-        return {"accepted": accepted, "goal_id": goal_id_str}
+        threading.Thread(
+            target=_wait_for_result,
+            name="nav_goal_result_waiter",
+            daemon=True,
+        ).start()
+    else:
+        # Goal rejected — clear any stale state
+        with _state_lock:
+            _active_goal_handle = None
+            _active_goal_id = goal_id_str
+            _current_status = "ABORTED"
 
-    finally:
-        # Always destroy the action client to avoid resource leaks; the node
-        # itself is long-lived and reused.
-        action_client.destroy()
+    return {"accepted": accepted, "goal_id": goal_id_str}
 
 
 def _blocking_cancel_nav_goal() -> dict:
@@ -278,7 +291,7 @@ def _blocking_cancel_nav_goal() -> dict:
 
     try:
         cancel_future = handle.cancel_goal_async()
-        cancel_response = _await_rclpy_future(cancel_future, timeout=10.0)
+        cancel_response = _await_rclpy_future(cancel_future, timeout=15.0)
 
         # cancel_response.return_code: 0 = ERROR_NONE (success), others = failure
         # action_msgs/srv/CancelGoal_Response: ERROR_NONE = 0
