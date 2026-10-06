@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/MapCanvas.tsx","./src/components/TopicField.tsx","./src/hooks/useKeyboardTeleop.ts","./src/lib/api.ts","./src/lib/dockingApi.ts","./src/lib/mapApi.ts","./src/tabs/DockingTab.tsx","./src/tabs/GoalPoseTab.tsx","./src/tabs/TeleopTab.tsx"],"version":"5.9.3"}

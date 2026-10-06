@@ -1,0 +1,22 @@
+{
+  plugins: {
+    ros2dds: {
+      nodename: "zenoh_bridge_topic_ros2dds",
+      domain: 88,  // matches ROS_DOMAIN_ID=88
+      ros_localhost_only: false,
+      allow: {
+        publishers: [".*"],
+        subscribers: [".*"],
+      }
+    },
+    rest: {
+      http_port: 7777
+    }
+  },
+
+  listen: {
+    endpoints: [
+      "tcp/0.0.0.0:7447"
+    ]
+  }
+}

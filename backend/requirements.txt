@@ -1,0 +1,12 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# HTTP client for talking to the Zenoh REST bridge
+httpx>=0.27.0
+
+# ROS 2 packages — these are not pip-installable; they come from the sourced
+# ROS 2 workspace.  Listed here as documentation only:
+#   rclpy
+#   rosidl_runtime_py
+#   geometry_msgs  (and any other message packages you need)

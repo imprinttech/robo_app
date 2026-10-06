@@ -1,0 +1,34 @@
+{
+  // Top-level Zenoh router timeout for query replies (milliseconds).
+  // The default is 10000 ms (10s), which is too short for the map service.
+  // This controls how long the Zenoh routing layer waits before returning
+  // a Timeout error to callers (including the REST plugin).
+  queries_default_timeout: 65000,
+
+  plugins: {
+    ros2dds: {
+      nodename: "zenoh_bridge_service",
+      domain: 88,  // matches ROS_DOMAIN_ID=88
+      ros_localhost_only: false,
+      allow: {
+        // service_servers: the bridge discovers ROS service servers and creates
+        // Zenoh queryables — this is what the REST API invokes via POST.
+        service_servers: [".*"],
+        // service_clients: also route client-side service traffic.
+        service_clients: [".*"]
+      },
+      queries_timeout: {
+        // Per-plugin timeout for ros2dds service calls.
+        default: 30.0,
+        services: ["map_server/map=60.0"]
+      }
+    },
+    rest: {
+      http_port: 8888
+    }
+  },
+
+  listen: {
+    endpoints: ["tcp/0.0.0.0:7448"]
+  }
+}
