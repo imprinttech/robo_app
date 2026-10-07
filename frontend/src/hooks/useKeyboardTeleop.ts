@@ -30,6 +30,7 @@ export interface TeleopConfig {
   msgType: string;
   linearSpeed: number;   // m/s  (e.g. 0.3)
   angularSpeed: number;  // rad/s (e.g. 0.6)
+  enabled?: boolean;     // Whether keyboard listener is currently active
 }
 
 export interface PublishStatus {
@@ -77,7 +78,7 @@ const ZERO_TWIST = {
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useKeyboardTeleop(config: TeleopConfig): UseTeleopReturn {
-  const { topic, msgType, linearSpeed, angularSpeed } = config;
+  const { topic, msgType, linearSpeed, angularSpeed, enabled = true } = config;
 
   // Track which keys are currently held
   const activeKeysRef = useRef<Set<TeleopKey>>(new Set());
@@ -93,6 +94,20 @@ export function useKeyboardTeleop(config: TeleopConfig): UseTeleopReturn {
     lastOk: null,
     lastError: null,
   });
+
+  // Reset keys if disabled while active
+  useEffect(() => {
+    if (!enabled) {
+      if (activeKeysRef.current.size > 0) {
+        activeKeysRef.current.clear();
+        setActiveKeys(new Set());
+        if (intervalRef.current !== null) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      }
+    }
+  }, [enabled]);
 
   // ── Publish helpers ─────────────────────────────────────────────────────────
 
@@ -178,6 +193,7 @@ export function useKeyboardTeleop(config: TeleopConfig): UseTeleopReturn {
   // ── Keyboard event listeners ────────────────────────────────────────────────
 
   useEffect(() => {
+    if (!enabled) return;
     const VALID: Set<string> = new Set(["w", "s", "a", "d", "x"]);
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -201,7 +217,7 @@ export function useKeyboardTeleop(config: TeleopConfig): UseTeleopReturn {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [startKey, stopKey]);
+  }, [enabled, startKey, stopKey]);
 
   // ── Safety: stop on blur / hidden tab ──────────────────────────────────────
 

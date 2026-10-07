@@ -150,6 +150,15 @@ async def publish_topic(req: PublishRequest) -> PublishResponse:
         )
 
     logger.debug("Published %s (%d bytes) to %s", req.msg_type, len(payload), req.topic)
+
+    if req.topic == "/pause_navigation":
+        try:
+            from app import ros_action_client
+            paused_val = bool(req.data.get("data", False)) if isinstance(req.data, dict) else False
+            ros_action_client.set_nav_paused(paused_val)
+        except Exception as p_err:
+            logger.warning("Could not sync nav pause state: %s", p_err)
+
     return PublishResponse(
         ok=True,
         topic=req.topic,

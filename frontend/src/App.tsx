@@ -38,23 +38,6 @@ const TABS: Tab[] = [
   { id: "settings", label: "Settings",  icon: "⚙️",  disabled: true  },
 ];
 
-// ── Render switch ─────────────────────────────────────────────────────────────
-
-function renderTab(id: TabId) {
-  switch (id) {
-    case "teleop":    return <TeleopTab />;
-    case "goalpose":  return <GoalPoseTab />;
-    case "docking":   return <DockingTab />;
-    default:          return (
-      <div className="tab-soon">
-        <div className="tab-soon__icon">🚧</div>
-        <h2>Coming Soon</h2>
-        <p>This tab is under construction. Check back after the Teleop tab is stable.</p>
-      </div>
-    );
-  }
-}
-
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -102,13 +85,41 @@ export default function App() {
       </nav>
 
       {/* ── Tab panel ───────────────────────────────────────────────────── */}
-      <main
-        id={`tabpanel-${activeTab}`}
-        role="tabpanel"
-        aria-labelledby={`tab-btn-${activeTab}`}
-        className="tab-panel"
-      >
-        {renderTab(activeTab)}
+      <main className="tab-panel">
+        <div
+          id="tabpanel-teleop"
+          role="tabpanel"
+          aria-labelledby="tab-btn-teleop"
+          className={`tab-pane ${activeTab === "teleop" ? "tab-pane--active" : "tab-pane--hidden"}`}
+        >
+          <TeleopTab isActive={activeTab === "teleop"} />
+        </div>
+
+        <div
+          id="tabpanel-goalpose"
+          role="tabpanel"
+          aria-labelledby="tab-btn-goalpose"
+          className={`tab-pane ${activeTab === "goalpose" ? "tab-pane--active" : "tab-pane--hidden"}`}
+        >
+          <GoalPoseTab />
+        </div>
+
+        <div
+          id="tabpanel-docking"
+          role="tabpanel"
+          aria-labelledby="tab-btn-docking"
+          className={`tab-pane ${activeTab === "docking" ? "tab-pane--active" : "tab-pane--hidden"}`}
+        >
+          <DockingTab />
+        </div>
+
+        {activeTab !== "teleop" && activeTab !== "goalpose" && activeTab !== "docking" && (
+          <div className="tab-soon">
+            <div className="tab-soon__icon">🚧</div>
+            <h2>Coming Soon</h2>
+            <p>This tab is under construction. Check back after the Teleop tab is stable.</p>
+          </div>
+        )}
       </main>
 
       {/* ── Footer ──────────────────────────────────────────────────────── */}

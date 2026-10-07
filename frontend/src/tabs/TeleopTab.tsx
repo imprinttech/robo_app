@@ -44,7 +44,11 @@ const DPAD_BUTTONS: DpadButton[] = [
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function TeleopTab() {
+interface TeleopTabProps {
+  isActive?: boolean;
+}
+
+export function TeleopTab({ isActive = true }: TeleopTabProps) {
   const [topic,   setTopic]   = useState("/cmd_vel_teleop");
   const [msgType, setMsgType] = useState("geometry_msgs/msg/Twist");
   const [linear,  setLinear]  = useState(DEFAULT_LINEAR);
@@ -55,6 +59,7 @@ export function TeleopTab() {
     msgType,
     linearSpeed:  linear,
     angularSpeed: angular,
+    enabled:      isActive,
   });
 
   function handleTopicChange(t: string, mt: string) {
