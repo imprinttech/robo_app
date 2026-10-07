@@ -66,11 +66,23 @@ class CancelResponse(BaseModel):
     message: str
 
 
+class GoalCoords(BaseModel):
+    x: float
+    y: float
+    yaw_deg: float = 0.0
+
+
 class StatusResponse(BaseModel):
     active: bool
     goal_id: str
     status: str          # "ACCEPTED" | "EXECUTING" | "SUCCEEDED" | "CANCELED" | "UNKNOWN"
     distance_remaining: float = 0.0
+    goal: GoalCoords | None = None
+    paused: bool = False
+
+
+class PauseRequest(BaseModel):
+    paused: bool
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -125,7 +137,27 @@ async def get_goal_status() -> StatusResponse:
         goal_id=ros_action_client._active_goal_id,  # module-level cache
         status=nav_status["status"],
         distance_remaining=nav_status["distance_remaining"],
+        goal=nav_status.get("goal"),
+        paused=nav_status.get("paused", False),
     )
+
+
+@router.post("/pause")
+async def pause_nav() -> dict:
+    """Pause navigation: cancels the active Nav2 goal and holds position."""
+    try:
+        return await ros_action_client.pause_nav_goal()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/resume")
+async def resume_nav() -> dict:
+    """Resume navigation: resends the goal to continue navigation to the destination."""
+    try:
+        return await ros_action_client.resume_nav_goal()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.delete("/goal", response_model=CancelResponse)

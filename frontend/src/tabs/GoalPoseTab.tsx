@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MapCanvas } from "../components/MapCanvas";
 import {
-  fetchMap, fetchPose, fetchNavStatus, sendGoal, publishPauseNavigation,
+  fetchMap, fetchPose, fetchNavStatus, sendGoal, pauseNavigation, resumeNavigation,
 } from "../lib/mapApi";
 import type { MapData, RobotPose, NavStatus } from "../lib/mapApi";
 
@@ -25,43 +25,44 @@ interface GoalPose { x: number; y: number; yaw_deg: number; }
 
 // ── Status badge colours ───────────────────────────────────────────────────────
 const STATUS_CLASS: Record<string, string> = {
-  ACCEPTED:  "badge--ok",
+  ACCEPTED: "badge--ok",
   EXECUTING: "badge--ok",
+  PAUSED: "badge--warn",
   SUCCEEDED: "badge--ok",
-  CANCELED:  "badge--warn",
+  CANCELED: "badge--warn",
   CANCELING: "badge--warn",
-  ABORTED:   "badge--err",
-  UNKNOWN:   "badge--dim",
+  ABORTED: "badge--err",
+  UNKNOWN: "badge--dim",
 };
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function GoalPoseTab() {
   // Map
-  const [mapData,     setMapData]     = useState<MapData | null>(null);
-  const [mapLoading,  setMapLoading]  = useState(true);
-  const [mapError,    setMapError]    = useState<string | null>(null);
+  const [mapData, setMapData] = useState<MapData | null>(null);
+  const [mapLoading, setMapLoading] = useState(true);
+  const [mapError, setMapError] = useState<string | null>(null);
 
   // Robot pose
-  const [robotPose,   setRobotPose]   = useState<RobotPose | null>(null);
+  const [robotPose, setRobotPose] = useState<RobotPose | null>(null);
 
   // Goal placement
-  const [goalPose,    setGoalPose]    = useState<GoalPose | null>(null);
-  const [manualX,     setManualX]     = useState("0.00");
-  const [manualY,     setManualY]     = useState("0.00");
-  const [manualYaw,   setManualYaw]   = useState("0");
+  const [goalPose, setGoalPose] = useState<GoalPose | null>(null);
+  const [manualX, setManualX] = useState("0.00");
+  const [manualY, setManualY] = useState("0.00");
+  const [manualYaw, setManualYaw] = useState("0");
 
   // Nav status
-  const [navStatus,   setNavStatus]   = useState<NavStatus | null>(null);
+  const [navStatus, setNavStatus] = useState<NavStatus | null>(null);
 
   // Send / pause UI
-  const [sending,     setSending]     = useState(false);
-  const [sendError,   setSendError]   = useState<string | null>(null);
-  const [paused,      setPaused]      = useState(false);
-  const [pausing,     setPausing]     = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [pausing, setPausing] = useState(false);
 
   // Poll intervals
-  const poseIntervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const poseIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const statusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── Load map once on mount ─────────────────────────────────────────────────
@@ -94,6 +95,17 @@ export function GoalPoseTab() {
       try {
         const s = await fetchNavStatus();
         setNavStatus(s);
+
+        if (s.active && s.goal) {
+          setGoalPose(s.goal);
+        } else if (!s.active && (s.status === "SUCCEEDED" || s.status === "CANCELED" || s.status === "ABORTED")) {
+          setGoalPose(null);
+          setPaused(false);
+        }
+
+        if (s.active && typeof s.paused === "boolean") {
+          setPaused(s.paused);
+        }
       } catch { /* non-fatal */ }
     };
     poll();
@@ -120,8 +132,8 @@ export function GoalPoseTab() {
 
   // ── Send goal ──────────────────────────────────────────────────────────────
   const handleSend = async () => {
-    const x   = parseFloat(manualX);
-    const y   = parseFloat(manualY);
+    const x = parseFloat(manualX);
+    const y = parseFloat(manualY);
     const yaw = parseFloat(manualYaw);
     if (isNaN(x) || isNaN(y) || isNaN(yaw)) {
       setSendError("Invalid goal coordinates");
@@ -131,7 +143,6 @@ export function GoalPoseTab() {
     setSendError(null);
     // Always start a fresh goal unpaused
     if (paused) {
-      try { await publishPauseNavigation(false); } catch { /* best-effort */ }
       setPaused(false);
     }
     try {
@@ -144,20 +155,20 @@ export function GoalPoseTab() {
     }
   };
 
-  // ── Stop / Resume (BT pause) ───────────────────────────────────────────────
+  // ── Stop / Resume ──────────────────────────────────────────────────────────
   const handleToggleStop = async () => {
     setPausing(true);
     setSendError(null);
     try {
       if (!paused) {
-        await publishPauseNavigation(true);
+        await pauseNavigation();
         setPaused(true);
       } else {
-        await publishPauseNavigation(false);
+        await resumeNavigation();
         setPaused(false);
       }
     } catch (e: unknown) {
-      setSendError(e instanceof Error ? e.message : "Pause toggle failed");
+      setSendError(e instanceof Error ? e.message : "Pause/Resume failed");
     } finally {
       setPausing(false);
     }
@@ -175,7 +186,7 @@ export function GoalPoseTab() {
 
   // ── Status helpers ─────────────────────────────────────────────────────────
   const statusStr = navStatus?.status ?? "UNKNOWN";
-  const isActive  = navStatus?.active ?? false;
+  const isActive = navStatus?.active ?? false;
 
   return (
     <div className="goalpose-tab">
@@ -240,7 +251,7 @@ export function GoalPoseTab() {
         <div className="card">
           <div className="card__title">Navigation Goal</div>
           <p className="goalpose-hint">
-            🎯 Drag an arrow on the map to set goal &amp; orientation (like RViz), or enter coordinates manually:
+            🎯 Drag an arrow on the map to set goal &amp; orientation, or enter coordinates manually:
           </p>
           <div className="goalpose-actions">
             <button

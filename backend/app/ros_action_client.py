@@ -53,6 +53,9 @@ _active_goal_handle: Any = None          # rclpy GoalHandle or None
 _active_goal_id: str = ""                # UUID string
 _current_status: str = "UNKNOWN"         # human-readable status string
 _distance_remaining: float = 0.0         # metres, updated by feedback callback
+_active_goal_coords: dict | None = None  # {"x": float, "y": float, "yaw_deg": float} or None
+_paused_goal_coords: dict | None = None  # Preserves goal coordinates while navigation is paused
+_is_paused: bool = False                 # Tracks if Nav2 navigation is paused
 
 # ── Status integer → string mapping (matches action_msgs/msg/GoalStatus) ───────
 # GoalStatus integer constants from action_msgs.msg.GoalStatus:
@@ -169,7 +172,7 @@ def _blocking_send_nav_goal(x: float, y: float, yaw_deg: float) -> dict:
     from nav2_msgs.action import NavigateToPose
     from rosidl_runtime_py.set_message import set_message_fields
 
-    global _active_goal_handle, _active_goal_id, _current_status, _distance_remaining
+    global _active_goal_handle, _active_goal_id, _current_status, _distance_remaining, _active_goal_coords, _is_paused
 
     action_client = _get_or_create_action_client()
 
@@ -233,11 +236,13 @@ def _blocking_send_nav_goal(x: float, y: float, yaw_deg: float) -> dict:
             _active_goal_id = goal_id_str
             _current_status = "ACCEPTED"
             _distance_remaining = 0.0
+            _active_goal_coords = {"x": x, "y": y, "yaw_deg": yaw_deg}
+            _is_paused = False
 
         # Kick off get_result_async() in a daemon thread; it will update
         # the status cache when the action terminates.
         def _wait_for_result() -> None:
-            global _current_status, _active_goal_handle
+            global _current_status, _active_goal_handle, _active_goal_coords, _is_paused, _paused_goal_coords
             try:
                 result_future = goal_handle.get_result_async()
                 result_response = _await_rclpy_future(
@@ -251,15 +256,25 @@ def _blocking_send_nav_goal(x: float, y: float, yaw_deg: float) -> dict:
                     terminal,
                 )
                 with _state_lock:
-                    _current_status = terminal
                     _active_goal_handle = None
+                    if _is_paused:
+                        _current_status = "PAUSED"
+                    else:
+                        _current_status = terminal
+                        _active_goal_coords = None
+                        _paused_goal_coords = None
+                        _is_paused = False
             except Exception as exc:
                 logger.error(
                     "ros_action_client: _wait_for_result error: %s", exc
                 )
                 with _state_lock:
-                    _current_status = "UNKNOWN"
                     _active_goal_handle = None
+                    if not _is_paused:
+                        _current_status = "UNKNOWN"
+                        _active_goal_coords = None
+                        _paused_goal_coords = None
+                        _is_paused = False
 
         threading.Thread(
             target=_wait_for_result,
@@ -272,21 +287,33 @@ def _blocking_send_nav_goal(x: float, y: float, yaw_deg: float) -> dict:
             _active_goal_handle = None
             _active_goal_id = goal_id_str
             _current_status = "ABORTED"
+            _active_goal_coords = None
+            _paused_goal_coords = None
+            _is_paused = False
 
     return {"accepted": accepted, "goal_id": goal_id_str}
 
 
-def _blocking_cancel_nav_goal() -> dict:
+def _blocking_cancel_nav_goal(is_pause: bool = False) -> dict:
     """
     Synchronous cancel of the active goal. Run in thread-pool.
+    If is_pause is True, preserves the active goal coordinates in _paused_goal_coords.
     """
-    global _active_goal_handle, _current_status, _active_goal_id
+    global _active_goal_handle, _current_status, _active_goal_id, _active_goal_coords, _is_paused, _paused_goal_coords
 
     with _state_lock:
         handle = _active_goal_handle
         gid = _active_goal_id
+        if is_pause and _active_goal_coords is not None:
+            _paused_goal_coords = dict(_active_goal_coords)
+            _is_paused = True
 
     if handle is None:
+        if is_pause and _paused_goal_coords is not None:
+            with _state_lock:
+                _is_paused = True
+                _current_status = "PAUSED"
+            return {"ok": True, "message": "Navigation paused"}
         return {"ok": True, "message": "No active goal to cancel"}
 
     try:
@@ -306,13 +333,28 @@ def _blocking_cancel_nav_goal() -> dict:
         if ok:
             with _state_lock:
                 _active_goal_handle = None
-                _current_status = "CANCELED"
+                if is_pause:
+                    _current_status = "PAUSED"
+                    _is_paused = True
+                else:
+                    _current_status = "CANCELED"
+                    _active_goal_coords = None
+                    _paused_goal_coords = None
+                    _is_paused = False
 
         return {"ok": ok, "message": msg}
 
     except Exception as exc:
         logger.error("ros_action_client: cancel error: %s", exc)
         return {"ok": False, "message": f"Cancel error: {exc}"}
+
+
+def set_nav_paused(paused: bool) -> None:
+    """Update navigation paused flag in memory cache."""
+    global _is_paused
+    with _state_lock:
+        _is_paused = paused
+    logger.info("ros_action_client: set_nav_paused -> %s", paused)
 
 
 # ── Public async API ───────────────────────────────────────────────────────────
@@ -359,19 +401,25 @@ async def get_nav_status() -> dict:
         {
             "active": bool,
             "status": "ACCEPTED"|"EXECUTING"|"SUCCEEDED"|"CANCELED"|
-                      "ABORTED"|"CANCELING"|"UNKNOWN",
-            "distance_remaining": float  (metres, 0.0 when not active)
+                      "ABORTED"|"CANCELING"|"UNKNOWN"|"PAUSED",
+            "distance_remaining": float  (metres, 0.0 when not active),
+            "goal": {"x": float, "y": float, "yaw_deg": float} | None,
+            "paused": bool
         }
     """
     with _state_lock:
         status = _current_status
         dist = _distance_remaining
         active = _active_goal_handle is not None
+        paused = _is_paused
+        coords = _active_goal_coords if active else (_paused_goal_coords if paused else None)
 
     return {
-        "active": active,
+        "active": active or paused,
         "status": status,
         "distance_remaining": dist,
+        "goal": coords,
+        "paused": paused,
     }
 
 
@@ -385,5 +433,49 @@ async def cancel_nav_goal() -> dict:
         {"ok": bool, "message": str}
     """
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, _blocking_cancel_nav_goal)
+    result = await loop.run_in_executor(None, _blocking_cancel_nav_goal, False)
     return result
+
+
+async def pause_nav_goal() -> dict:
+    """
+    Pause navigation: cancels the active Nav2 goal so the robot stops moving immediately,
+    while remembering the destination coordinates so navigation can be resumed.
+    """
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _blocking_cancel_nav_goal, True)
+    # Zero velocity to teleop topic just in case
+    try:
+        from app import ros_messages, zenoh_client
+        payload = ros_messages.serialize("geometry_msgs/msg/Twist", {
+            "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+        })
+        await zenoh_client.put_topic("/cmd_vel_teleop", payload)
+    except Exception:
+        pass
+    return {"ok": result.get("ok", False), "paused": True}
+
+
+async def resume_nav_goal() -> dict:
+    """
+    Resume navigation: re-sends the saved goal coordinates to Nav2.
+    """
+    global _paused_goal_coords, _is_paused
+    with _state_lock:
+        coords = _paused_goal_coords
+
+    if not coords:
+        return {"ok": False, "message": "No paused goal to resume"}
+
+    res = await send_nav_goal(
+        x=coords["x"],
+        y=coords["y"],
+        yaw_deg=coords["yaw_deg"],
+    )
+    accepted = res.get("accepted", False)
+    if accepted:
+        with _state_lock:
+            _is_paused = False
+            _paused_goal_coords = None
+    return {"ok": accepted, "paused": not accepted, "goal_id": res.get("goal_id", "")}

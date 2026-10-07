@@ -75,6 +75,8 @@ export interface NavStatus {
   /** "ACCEPTED" | "EXECUTING" | "SUCCEEDED" | "CANCELED" | "UNKNOWN" */
   status: string;
   distance_remaining: number;
+  goal?: { x: number; y: number; yaw_deg: number } | null;
+  paused?: boolean;
 }
 
 export async function sendGoal(req: GoalRequest): Promise<GoalResponse> {
@@ -107,26 +109,37 @@ export async function cancelGoal(): Promise<void> {
   }
 }
 
-// ── Pause / Resume via BT PauseCondition ─────────────────────────────────────
+// ── Pause / Resume Navigation ────────────────────────────────────────────────
 
-/**
- * Publish a std_msgs/Bool to /pause_navigation.
- * The PauseCondition BT node in the nav tree reads this topic:
- *   true  → navigation paused (robot holds position, goal stays active)
- *   false → navigation resumed
- */
-export async function publishPauseNavigation(paused: boolean): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/publish`, {
+export async function pauseNavigation(): Promise<{ ok: boolean; paused: boolean }> {
+  const res = await fetch(`${API_BASE}/api/nav/pause`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      topic: "/pause_navigation",
-      msg_type: "std_msgs/msg/Bool",
-      data: { data: paused },
-    }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body?.detail ?? `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function resumeNavigation(): Promise<{ ok: boolean; paused: boolean }> {
+  const res = await fetch(`${API_BASE}/api/nav/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.detail ?? `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Alias for backward compatibility */
+export async function publishPauseNavigation(paused: boolean): Promise<void> {
+  if (paused) {
+    await pauseNavigation();
+  } else {
+    await resumeNavigation();
   }
 }

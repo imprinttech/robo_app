@@ -116,6 +116,15 @@
   overflow-y: auto;
 }
 
+/* ── Tab panes (persists mounted component state across tabs) ───────────── */
+.tab-pane {
+  display: contents;
+}
+
+.tab-pane--hidden {
+  display: none !important;
+}
+
 /* ── Coming soon placeholder ────────────────────────────────────────────── */
 .tab-soon {
   display: flex;

@@ -57,6 +57,12 @@ interface PanState {
   initY: number;
 }
 
+interface RotateState {
+  isRotating: boolean;
+  startAngle: number;    // angle (rad) from canvas centre to pointer at drag start
+  startRotation: number; // mapRotation value at drag start (degrees)
+}
+
 // ── Occupancy Grid Colors ─────────────────────────────────────────────────────
 const COLOR_OCC = [248, 81, 73]; // Occupied RGB
 
@@ -101,8 +107,10 @@ export const MapCanvas: React.FC<Props> = ({
   // View camera state (confined strictly to map alone)
   const [zoom, setZoom] = useState<number>(1.0);
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [mode, setMode] = useState<"goal" | "pan">("goal");
+  const [mapRotation, setMapRotation] = useState<number>(0); // degrees CCW
+  const [mode, setMode] = useState<"goal" | "pan" | "rotate">("goal");
   const [isPanningUI, setIsPanningUI] = useState(false);
+  const [isRotatingUI, setIsRotatingUI] = useState(false);
 
   // Live drag state for RViz-style goal arrow placement
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -125,7 +133,7 @@ export const MapCanvas: React.FC<Props> = ({
     return () => ro.disconnect();
   }, []);
 
-  // Mutable refs for tracking active drag and pan operations
+  // Mutable refs for tracking active drag, pan, and rotate operations
   const dragRef = useRef<DragState | null>(null);
   const panRef = useRef<PanState>({
     isPanning: false,
@@ -133,6 +141,11 @@ export const MapCanvas: React.FC<Props> = ({
     startY: 0,
     initX: 0,
     initY: 0,
+  });
+  const rotateRef = useRef<RotateState>({
+    isRotating: false,
+    startAngle: 0,
+    startRotation: 0,
   });
 
   // Active pointers map for mobile multi-touch (pinch-to-zoom & two-finger pan)
@@ -218,17 +231,58 @@ export const MapCanvas: React.FC<Props> = ({
     return { cssWidth, cssHeight, fitScale, cellScale, viewX, viewY };
   }, [mapData, zoom, panOffset]);
 
+  // Rotate a canvas-space point around the canvas centre by -mapRotation
+  // (un-rotates the rotated canvas coordinate back to the unrotated map space)
+  const unrotateScreenPoint = useCallback(
+    (sx: number, sy: number): [number, number] => {
+      const canvas = canvasRef.current;
+      if (!canvas) return [sx, sy];
+      const rect = canvas.getBoundingClientRect();
+      const cx = Math.max(100, rect.width) / 2;
+      const cy = Math.max(100, rect.height) / 2;
+      const rad = -(mapRotation * Math.PI) / 180;
+      const dx = sx - cx;
+      const dy = sy - cy;
+      return [
+        cx + dx * Math.cos(rad) - dy * Math.sin(rad),
+        cy + dx * Math.sin(rad) + dy * Math.cos(rad),
+      ];
+    },
+    [mapRotation]
+  );
+
+  // Rotate an unrotated canvas-space point into the rotated frame
+  const rotateScreenPoint = useCallback(
+    (sx: number, sy: number): [number, number] => {
+      const canvas = canvasRef.current;
+      if (!canvas) return [sx, sy];
+      const rect = canvas.getBoundingClientRect();
+      const cx = Math.max(100, rect.width) / 2;
+      const cy = Math.max(100, rect.height) / 2;
+      const rad = (mapRotation * Math.PI) / 180;
+      const dx = sx - cx;
+      const dy = sy - cy;
+      return [
+        cx + dx * Math.cos(rad) - dy * Math.sin(rad),
+        cy + dx * Math.sin(rad) + dy * Math.cos(rad),
+      ];
+    },
+    [mapRotation]
+  );
+
   const screenToWorld = useCallback(
     (sx: number, sy: number): [number, number] => {
       if (!mapData) return [0, 0];
+      // Un-rotate the screen point into the unrotated map frame first
+      const [ux, uy] = unrotateScreenPoint(sx, sy);
       const { cellScale, viewX, viewY } = getViewportMetrics();
-      const cellX = (sx - viewX) / cellScale;
-      const cellY = mapData.height - (sy - viewY) / cellScale;
+      const cellX = (ux - viewX) / cellScale;
+      const cellY = mapData.height - (uy - viewY) / cellScale;
       const wx = cellX * mapData.resolution + mapData.origin_x;
       const wy = cellY * mapData.resolution + mapData.origin_y;
       return [wx, wy];
     },
-    [mapData, getViewportMetrics]
+    [mapData, getViewportMetrics, unrotateScreenPoint]
   );
 
   const worldToScreen = useCallback(
@@ -237,11 +291,13 @@ export const MapCanvas: React.FC<Props> = ({
       const { cellScale, viewX, viewY } = getViewportMetrics();
       const cellX = (wx - mapData.origin_x) / mapData.resolution;
       const cellY = (wy - mapData.origin_y) / mapData.resolution;
-      const sx = viewX + cellX * cellScale;
-      const sy = viewY + (mapData.height - cellY) * cellScale;
-      return [sx, sy];
+      // Unrotated canvas position
+      const ux = viewX + cellX * cellScale;
+      const uy = viewY + (mapData.height - cellY) * cellScale;
+      // Rotate into current map rotation frame
+      return rotateScreenPoint(ux, uy);
     },
-    [mapData, getViewportMetrics]
+    [mapData, getViewportMetrics, rotateScreenPoint]
   );
 
   // ── Render Frame ────────────────────────────────────────────────────────────
@@ -267,7 +323,14 @@ export const MapCanvas: React.FC<Props> = ({
     ctx.fillStyle = "#0a0e14";
     ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-    // 2. Draw offscreen occupancy map
+    // 2. Apply map rotation around canvas centre
+    const rotRad = (mapRotation * Math.PI) / 180;
+    ctx.save();
+    ctx.translate(cssWidth / 2, cssHeight / 2);
+    ctx.rotate(rotRad);
+    ctx.translate(-cssWidth / 2, -cssHeight / 2);
+
+    // 3. Draw offscreen occupancy map
     if (offscreenRef.current) {
       ctx.imageSmoothingEnabled = false; // Preserve crisp grid cells
       ctx.drawImage(
@@ -283,12 +346,12 @@ export const MapCanvas: React.FC<Props> = ({
       );
     }
 
-    // 3. Draw map boundary border
+    // 4. Draw map boundary border
     ctx.strokeStyle = "rgba(88, 166, 255, 0.25)";
     ctx.lineWidth = 1;
     ctx.strokeRect(viewX, viewY, mapData.width * cellScale, mapData.height * cellScale);
 
-    // 4. Subtle distance grid overlay when zoomed in
+    // 5. Subtle distance grid overlay when zoomed in
     if (cellScale >= 3.5) {
       ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
       ctx.lineWidth = 0.5;
@@ -309,35 +372,57 @@ export const MapCanvas: React.FC<Props> = ({
       }
     }
 
-    // 5. Draw Placed Goal Pose (if set)
+    ctx.restore(); // Undo map rotation — restore context to physical screen space
+
+    // 6. Draw Placed Goal Pose (if set)
     if (goalPose && !dragState?.isDragging) {
       const [gx, gy] = worldToScreen(goalPose.x, goalPose.y);
-      drawNavGoalMarker(ctx, gx, gy, goalPose.yaw_deg, false);
+      drawNavGoalMarker(ctx, gx, gy, goalPose.yaw_deg - mapRotation, false);
       drawSimpleLabel(ctx, gx, gy, "Goal", "#f0a500");
     }
 
-    // 6. Draw Robot Pose with prominent directional arrow (Requirement 1)
+    // 7. Draw Robot Pose with prominent directional arrow
     if (robotPose) {
       const [rx, ry] = worldToScreen(robotPose.x, robotPose.y);
-      drawRobotMarker(ctx, rx, ry, robotPose.yaw_deg);
+      drawRobotMarker(ctx, rx, ry, robotPose.yaw_deg - mapRotation);
       drawSimpleLabel(ctx, rx, ry, "Robot", "#58a6ff");
     }
 
-    // 7. Draw RViz-style Click-and-Drag Live Goal Arrow (Requirement 2)
+    // 8. Draw RViz-style Click-and-Drag Live Goal Arrow
     if (dragState?.isDragging) {
       const [sx, sy] = dragState.startScreen;
       const [cx, cy] = dragState.curScreen;
       const dragDist = Math.hypot(cx - sx, cy - sy);
       const arrowLen = Math.max(28, dragDist);
 
-      // Draw dynamic arrow stretching toward cursor
-      drawNavGoalMarker(ctx, sx, sy, dragState.yawDeg, true, arrowLen);
+      drawNavGoalMarker(ctx, sx, sy, dragState.yawDeg - mapRotation, true, arrowLen);
 
-      // HUD readout badge next to the cursor
+      // HUD readout badge next to the cursor (always upright and readable)
       const hudText = `🎯 Goal: (${dragState.startWorld[0].toFixed(2)}, ${dragState.startWorld[1].toFixed(2)})  Heading: ${dragState.yawDeg.toFixed(1)}°`;
       drawHUDTag(ctx, cx + 16, cy - 12, hudText);
     }
-  }, [mapData, robotPose, goalPose, dragState, zoom, panOffset, getViewportMetrics, renderMapOffscreen, worldToScreen]);
+
+    // 9. Draw rotation badge overlay (top-right, always upright)
+    if (mapRotation !== 0) {
+      const badgeText = `↻ ${((mapRotation % 360) + 360) % 360}°`;
+      ctx.font = "bold 11px sans-serif";
+      const tw = ctx.measureText(badgeText).width;
+      const bw = tw + 14;
+      const bh = 22;
+      const bx = cssWidth - bw - 10;
+      const by = 10;
+      ctx.fillStyle = "rgba(22, 27, 34, 0.88)";
+      ctx.strokeStyle = "rgba(88, 166, 255, 0.6)";
+      ctx.lineWidth = 1;
+      drawRoundRect(ctx, bx, by, bw, bh, 5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#79c0ff";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "center";
+      ctx.fillText(badgeText, bx + bw / 2, by + bh / 2);
+    }
+  }, [mapData, robotPose, goalPose, dragState, zoom, panOffset, mapRotation, getViewportMetrics, renderMapOffscreen, worldToScreen]);
 
   // ── Marker Drawing Helpers ──────────────────────────────────────────────────
 
@@ -604,6 +689,27 @@ export const MapCanvas: React.FC<Props> = ({
       return;
     }
 
+    // Left-click / Touch in Rotate Mode -> Free-spin the map
+    if (e.button === 0 && mode === "rotate") {
+      const rect = canvas.getBoundingClientRect();
+      const cx = rect.width / 2;
+      const cy = rect.height / 2;
+      const dx = (e.clientX - rect.left) - cx;
+      const dy = (e.clientY - rect.top) - cy;
+      rotateRef.current = {
+        isRotating: true,
+        startAngle: Math.atan2(dy, dx),
+        startRotation: mapRotation,
+      };
+      setIsRotatingUI(true);
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     // Left-click / Touch in Goal Mode -> Start RViz-style Goal Pose Drag
     if (e.button === 0 && mode === "goal") {
       const [wx, wy] = screenToWorld(mouseX, mouseY);
@@ -659,8 +765,9 @@ export const MapCanvas: React.FC<Props> = ({
       const rosPxNew = cellX * newCellScale;
       const rosPyNew = (mapData.height - cellY) * newCellScale;
 
-      const newPanX = curMidX - newBaseX - rosPxNew;
-      const newPanY = curMidY - newBaseY - rosPyNew;
+      const [uMidX, uMidY] = unrotateScreenPoint(curMidX, curMidY);
+      const newPanX = uMidX - newBaseX - rosPxNew;
+      const newPanY = uMidY - newBaseY - rosPyNew;
 
       setZoom(newZoom);
       setPanOffset({ x: newPanX, y: newPanY });
@@ -671,10 +778,27 @@ export const MapCanvas: React.FC<Props> = ({
     if (panRef.current.isPanning) {
       const dx = e.clientX - panRef.current.startX;
       const dy = e.clientY - panRef.current.startY;
+      const rad = -(mapRotation * Math.PI) / 180;
+      const unrotDx = dx * Math.cos(rad) - dy * Math.sin(rad);
+      const unrotDy = dx * Math.sin(rad) + dy * Math.cos(rad);
       setPanOffset({
-        x: panRef.current.initX + dx,
-        y: panRef.current.initY + dy,
+        x: panRef.current.initX + unrotDx,
+        y: panRef.current.initY + unrotDy,
       });
+      return;
+    }
+
+    // Handle Active Free-Rotate
+    if (rotateRef.current.isRotating) {
+      const rect = canvas.getBoundingClientRect();
+      const cx = rect.width / 2;
+      const cy = rect.height / 2;
+      const dx = (e.clientX - rect.left) - cx;
+      const dy = (e.clientY - rect.top) - cy;
+      const curAngle = Math.atan2(dy, dx);
+      const deltaRad = curAngle - rotateRef.current.startAngle;
+      const deltaDeg = (deltaRad * 180) / Math.PI;
+      setMapRotation(rotateRef.current.startRotation + deltaDeg);
       return;
     }
 
@@ -735,6 +859,12 @@ export const MapCanvas: React.FC<Props> = ({
       setIsPanningUI(false);
     }
 
+    // Finish Rotate
+    if (rotateRef.current.isRotating) {
+      rotateRef.current.isRotating = false;
+      setIsRotatingUI(false);
+    }
+
     // Finish Goal Placement (RViz Style) → auto-switch back to Pan
     if (dragRef.current?.isDragging) {
       const finalized = { ...dragRef.current };
@@ -790,8 +920,9 @@ export const MapCanvas: React.FC<Props> = ({
       const rosPxNew = cellX * newCellScale;
       const rosPyNew = (mapData.height - cellY) * newCellScale;
 
-      const newPanX = mouseX - newBaseX - rosPxNew;
-      const newPanY = mouseY - newBaseY - rosPyNew;
+      const [uMouseX, uMouseY] = unrotateScreenPoint(mouseX, mouseY);
+      const newPanX = uMouseX - newBaseX - rosPxNew;
+      const newPanY = uMouseY - newBaseY - rosPyNew;
 
       setZoom(newZoom);
       setPanOffset({ x: newPanX, y: newPanY });
@@ -801,9 +932,9 @@ export const MapCanvas: React.FC<Props> = ({
     return () => {
       canvas.removeEventListener("wheel", onWheel);
     };
-  }, [mapData, zoom, panOffset, screenToWorld, getViewportMetrics]);
+  }, [mapData, zoom, panOffset, screenToWorld, getViewportMetrics, unrotateScreenPoint]);
 
-  // ── Zoom Toolbar Controls ───────────────────────────────────────────────────
+  // ── Zoom & Rotate Toolbar Controls ─────────────────────────────────────────
   const handleZoomIn = () => {
     setZoom((z) => Math.min(10.0, z * 1.25));
   };
@@ -815,7 +946,9 @@ export const MapCanvas: React.FC<Props> = ({
   const handleResetView = () => {
     setZoom(1.0);
     setPanOffset({ x: 0, y: 0 });
+    setMapRotation(0);
   };
+
 
   // ── Loading & Error States ──────────────────────────────────────────────────
   if (loading) {
@@ -848,9 +981,13 @@ export const MapCanvas: React.FC<Props> = ({
 
   // ── Cursor Class Calculation ────────────────────────────────────────────────
   let cursorClass = "map-canvas--cursor-goal";
-  if (isPanningUI) {
+  if (isRotatingUI) {
+    cursorClass = "map-canvas--cursor-grabbing";
+  } else if (isPanningUI) {
     cursorClass = "map-canvas--cursor-grabbing";
   } else if (mode === "pan") {
+    cursorClass = "map-canvas--cursor-grab";
+  } else if (mode === "rotate") {
     cursorClass = "map-canvas--cursor-grab";
   } else if (dragState?.isDragging) {
     cursorClass = "map-canvas--cursor-dragging";
@@ -890,6 +1027,14 @@ export const MapCanvas: React.FC<Props> = ({
           >
             ✋ Pan
           </button>
+          <button
+            type="button"
+            className={`map-toolbar__btn ${mode === "rotate" ? "map-toolbar__btn--active" : ""}`}
+            onClick={() => setMode("rotate")}
+            title="Rotate Mode: Drag anywhere on the map to freely spin it in any direction"
+          >
+            ↻ Rotate
+          </button>
         </div>
 
         <div className="map-toolbar__group">
@@ -923,9 +1068,22 @@ export const MapCanvas: React.FC<Props> = ({
             type="button"
             className="map-toolbar__btn"
             onClick={handleResetView}
-            title="Fit to view / Reset pan"
+            title="Fit to view / Reset pan & rotation"
           >
             ⟲ Fit
+          </button>
+        </div>
+
+        <div className="map-toolbar__group">
+          <button
+            type="button"
+            className="map-toolbar__btn map-toolbar__btn--label"
+            onClick={() => setMapRotation(0)}
+            title="Current rotation — click to reset to 0°"
+            aria-label="Reset map rotation"
+            style={{ minWidth: 44 }}
+          >
+            {Math.round(((mapRotation % 360) + 360) % 360)}°
           </button>
         </div>
       </div>
@@ -933,10 +1091,10 @@ export const MapCanvas: React.FC<Props> = ({
       {/* ── Map Interactive Guide Footer ────────────────────────────────── */}
       <div className="map-footer-hint">
         <span className="map-footer-hint__desktop">
-          🎯 <strong>Left-drag</strong>: Goal & Heading · ✋ <strong>Right-drag</strong>: Pan · 🔍 <strong>Scroll</strong>: Zoom
+          🎯 <strong>Left-drag</strong>: Goal & Heading · ✋ <strong>Right-drag</strong>: Pan · 🔍 <strong>Scroll</strong>: Zoom · ↺↻ <strong>Rotate</strong>: map orientation
         </span>
         <span className="map-footer-hint__mobile">
-          🎯 <strong>Goal</strong>: Drag arrow · ✋ <strong>Pan</strong> · 🔍 Pinch zoom
+          🎯 <strong>Goal</strong>: Drag arrow · ✋ <strong>Pan</strong> · 🔍 Pinch zoom · ↺↻ Rotate
         </span>
       </div>
     </div>
